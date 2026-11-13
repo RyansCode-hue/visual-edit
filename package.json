@@ -1,0 +1,16 @@
+{
+  "name": "visual-edit",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "PoC: dev-only Vite plugin that lets a designer edit a running React app and writes the edits back to source.",
+  "main": "src/plugin.js",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "attune": "node bin/run.js"
+  },
+  "dependencies": {
+    "@babel/parser": "^7.26.0",
+    "magic-string": "^0.30.17"
+  }
+}
