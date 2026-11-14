@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Visual edit</title>
+  <link rel="stylesheet" href="/__ve/shell.css" />
+</head>
+<body>
+  <header class="toolbar">
+    <div class="brand">◆ Visual edit</div>
+    <div class="seg" id="mode" role="group" aria-label="Mode">
+      <button data-mode="design" class="on" title="Select and edit (hold Space to use the app)">Design</button>
+      <button data-mode="interact" title="Click through and use the app normally">Interact</button>
+    </div>
+    <div class="route">
+      <button id="reload" class="icon" title="Reload page">↻</button>
+      <input id="route" spellcheck="false" aria-label="Page path" />
+    </div>
+    <div class="seg" id="widths" role="group" aria-label="Viewport width">
+      <button data-w="" class="on" title="Fill the window">Full</button>
+      <button data-w="1280">1280</button>
+      <button data-w="1024">1024</button>
+      <button data-w="768">768</button>
+      <button data-w="390">390</button>
+    </div>
+    <div class="spacer"></div>
+    <button id="demo" class="ghost" hidden>Sign in as demo user</button>
+    <label class="switch" title="Show the page as it was before your changes">
+      <input type="checkbox" id="original" /> <span>Show original</span>
+    </label>
+    <button id="review" class="primary">Send for review <span id="count" class="pill">0</span></button>
+  </header>
+
+  <aside class="layers">
+    <div class="panel-title">Layers</div>
+    <div id="tree" class="tree"></div>
+  </aside>
+
+  <main class="stage" id="stage">
+    <div id="banner" class="banner" hidden></div>
+    <div class="frame-wrap"><iframe id="app" title="App preview"></iframe></div>
+    <div id="toast" class="toast" hidden></div>
+  </main>
+
+  <aside class="inspector">
+    <nav class="tabs" role="tablist">
+      <button data-tab="design" class="on">Design</button>
+      <button data-tab="theme">Theme</button>
+      <button data-tab="changes">Changes</button>
+    </nav>
+    <div id="panel" class="panel"></div>
+  </aside>
+
+  <div id="popover" class="popover" hidden></div>
+  <script type="module" src="/__ve/shell.js"></script>
+</body>
+</html>

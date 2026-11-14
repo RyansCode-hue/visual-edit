@@ -24,10 +24,21 @@ const vite = await import(pathToFileURL(path.join(viteDir, entry)).href);
 
 // The app's config reads .env files relative to cwd.
 process.chdir(appDir);
+// Editor options come from the environment so credentials stay out of code:
+//   VE_DEMO_USER / VE_DEMO_PASSWORD  MFA-exempt login for "Sign in as demo user"
+//   VE_DEMO_START                    page to open after that login (default /)
+//   VE_ALLOW_PUSH=1                  "Send for review" also pushes and opens a PR
 const server = await vite.createServer({
   root: appDir,
-  plugins: [visualEdit()],
+  plugins: [visualEdit({
+    demoUser: process.env.VE_DEMO_USER,
+    demoPassword: process.env.VE_DEMO_PASSWORD,
+    demoStart: process.env.VE_DEMO_START,
+    allowPush: process.env.VE_ALLOW_PUSH === "1",
+  })],
   server: { port, strictPort: false }, // next free port if taken
 });
 await server.listen();
 server.printUrls();
+const local = server.resolvedUrls?.local?.[0];
+if (local) console.log(`\n  \x1b[35m➜  Editor:\x1b[0m  ${new URL("/__ve/", local)}\n`);

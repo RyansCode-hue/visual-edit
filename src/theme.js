@@ -90,6 +90,8 @@ function collect(code, ast) {
         break;
       case "NumericLiteral":
         return leaf("number", node.value);
+      case "BooleanLiteral":
+        return leaf("boolean", node.value);
       case "CallExpression": {
         const c = node.callee;
         if (
@@ -147,6 +149,7 @@ function formatValue(value, kind, q) {
     return `${kind}(${value})`;
   }
   if (kind === "string") return quote(value, q);
+  if (typeof value === "boolean") return String(value);
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new EditError("Number is not finite");
     return String(value);

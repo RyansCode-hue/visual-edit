@@ -95,3 +95,13 @@ test("refuses text edits on dynamic content and stale locations", () => {
     (e) => e.status === 409,
   );
 });
+
+test("writes booleans as bare or {false} attributes", () => {
+  const off = applyEdit(SRC, FILE, 6, 6, { type: "prop", name: "withBorder", value: false });
+  assert.equal(off, SRC.replace(" withBorder>", " withBorder={false}>"));
+  assert.equal(inspect(off, FILE, 6, 6).attrs[2].value, false);
+  const on = applyEdit(off, FILE, 6, 6, { type: "prop", name: "withBorder", value: true });
+  assert.equal(on, SRC);
+  const added = applyEdit(SRC, FILE, 8, 10, { type: "prop", name: "inherit", value: true });
+  assert.equal(added, SRC.replace('c="dimmed">', 'c="dimmed" inherit>'));
+});

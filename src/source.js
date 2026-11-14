@@ -130,6 +130,9 @@ function describeAttr(attr, code) {
     if (e.type === "StringLiteral") {
       return { name, kind: "string", value: e.value };
     }
+    if (e.type === "BooleanLiteral") {
+      return { name, kind: "boolean", value: e.value };
+    }
     if (
       e.type === "UnaryExpression" && e.operator === "-" &&
       e.argument.type === "NumericLiteral"
@@ -398,19 +401,18 @@ function setProp(s, code, opening, name, value) {
     return;
   }
 
-  const formatted = formatValue(value);
+  if (attr && describeAttr(attr, code).kind === "computed") {
+    throw new EditError(`${name} is computed in code and can't be edited here`, 422);
+  }
+  // The whole attribute as it should read: `withBorder` for true,
+  // `withBorder={false}` for false, `name=<value>` otherwise.
+  const text = value === true
+    ? name
+    : value === false
+      ? `${name}={false}`
+      : `${name}=${formatValue(value)}`;
   if (attr) {
-    if (describeAttr(attr, code).kind === "computed") {
-      throw new EditError(
-        `${name} is computed in code and can't be edited here`,
-        422,
-      );
-    }
-    if (attr.value === null) {
-      s.overwrite(attr.start, attr.end, `${name}=${formatted}`);
-    } else {
-      s.overwrite(attr.value.start, attr.value.end, formatted);
-    }
+    s.overwrite(attr.start, attr.end, text);
     return;
   }
 
@@ -420,7 +422,7 @@ function setProp(s, code, opening, name, value) {
   const anchor = last ?? opening.typeArguments ?? opening.name;
   const multiline = last && last.loc.start.line !== opening.loc.start.line;
   const sep = multiline ? `\n${" ".repeat(last.loc.start.column)}` : " ";
-  s.appendLeft(anchor.end, `${sep}${name}=${formatted}`);
+  s.appendLeft(anchor.end, `${sep}${text}`);
 }
 
 function setText(s, code, element, value) {

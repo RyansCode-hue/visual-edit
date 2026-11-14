@@ -1,64 +1,84 @@
-# visual-edit (PoC spike)
+# visual-edit (PoC)
 
-Edit a running React + Mantine app in the browser; edits are written back to
-the JSX source as minimal diffs. Target: `atticus-backoffice` (Attune).
+A Figma-style editor for a running React + Mantine app. A designer selects and
+changes things on the real page; every change is written back to the source as
+a small, readable diff and can be sent to a developer as a git branch.
+Target: `atticus-backoffice` (Attune).
 
 ## Run
 
 ```bash
-cd src/web-app && npm install          # in the target app, once
-VITE_API_PROXY_URL=http://localhost:8080 node bin/run.js <path>/src/web-app
+cd <app>/src/web-app && npm install        # in the target app, once
+VITE_API_PROXY_URL=http://localhost:8080 \
+VE_DEMO_USER=admin VE_DEMO_PASSWORD='…' VE_DEMO_START=/dashboard \
+  node bin/run.js <app>/src/web-app
 ```
 
-Starts the app's own Vite config with the plugin added (default port 5390,
-next free if taken). The target repo is never modified except by edits you make.
-Click **✎ Edit** bottom-left.
+Open the **Editor** URL it prints (`http://localhost:5390/__ve/`; next free
+port if taken). The app's own Vite config is used as-is with the plugin added.
 
-## What works
+| Env var | Purpose |
+|---|---|
+| `VE_DEMO_USER` / `VE_DEMO_PASSWORD` | MFA-exempt local login behind **Sign in as …** (server-side; the password never reaches the browser). Locally: the seeded test user. |
+| `VE_DEMO_START` | Page to open after that login (Attune: `/dashboard`). |
+| `VE_ALLOW_PUSH=1` | **Send for review** also pushes the branch and opens a PR with `gh`. Off by default. |
 
-- Click any element → panel shows component, `file:line`, parent breadcrumb,
-  props from source, text. Repeated (`.map`) elements show `×N`.
-- Edit/add/remove props (`c`, `mb`, `w`, `fz`, …) with token suggestions.
-- Edit literal text in the panel or by double-clicking in place.
-- Resize via bottom/right handles with live `W × H px` readout (Shift snaps
-  to 8) → writes `w`/`h`.
-- Reorder: drag a selected element; a drop line shows where it lands. Siblings
-  only by default; hold ⌘/Ctrl to drop into another container (same file).
-  Also ↑/↓ buttons in the panel. Conditionals (`{x && <A/>}`) move with their
-  condition; elements are re-indented to their new depth. Elements from
-  `.map` callbacks or a component's root can't be moved (panel says why).
-- Scope: for Mantine components the panel has **This element / All <Button>**.
-  "All" edits `components.<Name>.defaultProps` in the theme; props this element
-  sets itself are starred (they won't follow the default).
-- **◐ Theme** panel: colour ramps as swatches (edits land in the ramp's const),
-  primary colour/shade, fonts, spacing (px, written as `rem()`), radius,
-  component defaults. Aliases and computed values are read-only.
-  Theme file = the one file calling `createTheme()`. Editing it reloads the
-  page; editor state is kept in sessionStorage.
-- Undo (server-side stack, refuses if file changed since). Covers theme edits.
-- Computed props / text from variables are shown read-only, never rewritten.
+## The editor
+
+- **Layout:** layers (left) · the app in an iframe (middle) · inspector (right).
+  Toolbar: Design / Interact mode, page path, viewport widths, demo sign-in,
+  Show original, Send for review.
+- **Design mode:** click to select, Esc selects the parent, drag to reorder
+  (⌘ to move into another container), double-click text to edit it, resize
+  from the handles (live px readout, Shift snaps to 8). Hold **Space** to use
+  the app without leaving Design mode; **Interact** turns editing off.
+- **Inspector** speaks design, not props:
+  Layout (Width/Height as Auto · Fill · Fixed px), Auto layout (gap, align,
+  justify for Stack/Group), Spacing (margin/padding box), Text (size, weight,
+  colour, align), Appearance (style, accent colour, component size, corner
+  radius, shadow, border, background). Raw props are under *More properties*,
+  file and line under *Developer info*.
+- **Design-system first:** spacing, radius and font sizes are token dropdowns
+  showing px (`md · 13px`); colours come from a swatch picker of the theme
+  ramps. Custom values are allowed but flagged ("Custom 14px · not in the
+  design system", or "14px equals md · Use md").
+- **Scope:** *This element* vs *All Buttons* (writes the theme's
+  `components.Button.defaultProps`; values this element sets itself are
+  starred). **Theme** tab: colour ramps, primary colour/shade, fonts, spacing
+  scale, component defaults.
+- **Locked, with the reason in plain words:** text filled in by the app, items
+  in a data-driven list, a component's outer frame, values computed in code.
+- **Changes** tab: every change in plain language ("Button “Sign In”: Corner
+  radius default → xl"), each individually revertable; ⌘Z reverts the latest.
+  **Show original** serves the pre-session version of every touched file (disk
+  untouched) for before/after. **Send for review** commits the session to
+  `design/<title>-<date>` with the change list as the message; it warns when a
+  touched file already had other uncommitted edits, since whole files are
+  committed.
 
 ## How
 
 - `src/source.js`: Babel parse + MagicString. Stamps `data-ve="file:line:col"`
-  in the dev transform only; reads and edits one element by location.
-- `src/plugin.js`: Vite plugin (serve only): transform, overlay injection,
-  `/__ve/inspect|edit|undo`. Writes limited to `.jsx/.tsx` under app root,
-  JSON + same-origin POSTs only.
-- `src/overlay.js`: vanilla DOM in a shadow root.
-- `npm test`: source-edit unit tests.
+  at load time (before other plugins reprint the code), reads one element,
+  edits props/text, moves elements.
+- `src/theme.js`: reads/writes the `createTheme({...})` object.
+- `src/changes.js`: change regions and revert-any-change.
+- `src/plugin.js`: Vite plugin (serve only) + `/__ve/` API. Writes limited to
+  `.js(x)/.ts(x)` under the app root; POSTs must be JSON from the same origin.
+- `src/canvas.js`: runs inside the app iframe (selection, drag, resize, text,
+  layer tree). `src/shell/`: the editor page.
+- `npm test`: unit tests for source, move, theme and change logic.
 
 ## Known gaps
 
-- Moving between files/components not supported.
-- JSX comments directly above a moved element stay behind.
-- No "apply to this page/section only" scope (would need a shared wrapper or
-  CSS module); scopes are element, component-wide, theme.
-- Compound components (`Card.Section`) and in-house components have no
-  component-wide scope.
-- `test/fixture-main.tsx.txt` is a snapshot of attune's `main.tsx`.
-- Panel can cover the right-edge resize handle.
+- Change log lives in server memory; restarting the editor forgets it (files
+  keep their edits).
+- Moving between files/components isn't supported; JSX comments directly above
+  a moved element stay behind.
+- Mantine inputs (`TextInput` etc.) carry the stamp on the `<input>`, so the
+  selection outline excludes their label.
+- No "this page/section only" scope; compound (`Card.Section`) and in-house
+  components have no component-wide scope.
 - No formatter pass after writes (repo targets ~80 cols).
-- Plain HTML elements: text only, no style props/resize.
-- Editing an element shifts the `col` of later elements on the same line
-  until reload.
+- No screenshots in the review; reviewers use Show original.
+- `test/fixture-main.tsx.txt` is a snapshot of Attune's `main.tsx`.
