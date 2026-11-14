@@ -24,7 +24,19 @@
       <button data-w="768">768</button>
       <button data-w="390">390</button>
     </div>
+    <label class="datasel" title="Show the page with simulated data">
+      Data
+      <select id="data">
+        <option value="live">Live</option>
+        <option value="empty">Empty lists</option>
+        <option value="loading">Loading</option>
+        <option value="error">Server error</option>
+        <option value="long">Long text</option>
+        <option value="many">Many rows</option>
+      </select>
+    </label>
     <div class="spacer"></div>
+    <button id="helpbtn" class="icon" title="Keyboard shortcuts (?)">?</button>
     <button id="demo" class="ghost" hidden>Sign in as demo user</button>
     <label class="switch" title="Show the page as it was before your changes">
       <input type="checkbox" id="original" /> <span>Show original</span>
@@ -47,12 +59,33 @@
     <nav class="tabs" role="tablist">
       <button data-tab="design" class="on">Design</button>
       <button data-tab="theme">Theme</button>
+      <button data-tab="checks">Checks</button>
       <button data-tab="changes">Changes</button>
     </nav>
     <div id="panel" class="panel"></div>
   </aside>
 
   <div id="popover" class="popover" hidden></div>
+  <div id="help" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Keyboard shortcuts</h2>
+      <table>
+        <tr><td>Click</td><td>Select the group (card, stack, row…)</td></tr>
+        <tr><td>Double-click</td><td>Go one level in · edit text</td></tr>
+        <tr><td>⌘ Click</td><td>Select exactly what's under the pointer</td></tr>
+        <tr><td>Esc · ⇧ Enter</td><td>Select the parent</td></tr>
+        <tr><td>Enter</td><td>Select the first thing inside</td></tr>
+        <tr><td>Tab · ⇧ Tab</td><td>Next · previous sibling</td></tr>
+        <tr><td>Arrow keys</td><td>Nudge 1px (⇧ 10px) — adjusts margin</td></tr>
+        <tr><td>Drag</td><td>Reorder · ⌘ drag into another container</td></tr>
+        <tr><td>Hold ⌥</td><td>Measure distances from the selection</td></tr>
+        <tr><td>Hold Space</td><td>Use the app without leaving Design mode</td></tr>
+        <tr><td>⌘ Z · ⇧⌘ Z</td><td>Undo · redo</td></tr>
+        <tr><td>?</td><td>This list</td></tr>
+      </table>
+      <button class="btn" id="helpclose">Close</button>
+    </div>
+  </div>
   <script type="module" src="/__ve/shell.js"></script>
 </body>
 </html>

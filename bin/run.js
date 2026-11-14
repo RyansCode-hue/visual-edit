@@ -9,6 +9,12 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import visualEdit from "../src/plugin.js";
 
+const major = Number(process.versions.node.split(".")[0]);
+if (major < 20) {
+  console.error(`visual-edit needs Node 20 or newer (Vite 7); this is Node ${process.versions.node}.`);
+  process.exit(1);
+}
+
 const appDir = path.resolve(process.argv[2] ?? ".");
 const port = Number(process.argv[3] ?? 5390);
 const viteDir = path.join(appDir, "node_modules", "vite");

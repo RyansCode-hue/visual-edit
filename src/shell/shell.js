@@ -35,6 +35,11 @@ const state = {
   collapsed: new Set(),
   expanded: new Set(),
   review: null,       // last send-for-review result
+  questions: [],      // questions for developers
+  pending: [],        // previewed theme edits: { path, value, label, vars, reach }
+  checks: [],         // page accessibility/overflow issues
+  figma: null,        // { name, tokens } imported from a Figma export
+  route: "/",
 };
 
 // ---------- API ----------
@@ -129,6 +134,8 @@ function select(s, { fromLayers = false } = {}) {
   closePopover();
   state.canvas?.setSelection(s);
   if (s && !fromLayers) revealInLayers(s);
+  // Keyboard shortcuts (Tab, Enter, arrows) are handled inside the canvas.
+  if (s && fromLayers) frame.contentWindow?.focus();
   renderTabs();
   renderLayers();
   refreshInfo();
@@ -140,15 +147,31 @@ async function refreshChanges() {
     state.changes = r.changes;
     state.showOriginal = r.showOriginal;
     state.dirtyBefore = r.dirtyBefore ?? [];
+    state.questions = (await api("questions")).questions;
   } catch (e) {
     toast(`Couldn't load the change list: ${e.message}`, true);
   }
-  $("#count").textContent = state.changes.length;
+  $("#count").textContent = state.changes.length + state.questions.length;
   renderTabs();
   $("#original").checked = state.showOriginal;
-  $("#banner").hidden = !state.showOriginal;
-  $("#banner").textContent = "Showing the original page. Editing is paused until you switch back.";
+  renderBanner();
+  sendPins();
   if (state.tab === "changes") renderPanel();
+}
+
+const DATA_LABELS = { empty: "Empty lists", loading: "Loading", error: "Server error", long: "Long text", many: "Many rows" };
+
+function renderBanner() {
+  const parts = [];
+  if (state.showOriginal) parts.push("Showing the original page. Editing is paused until you switch back.");
+  const data = $("#data").value;
+  if (data !== "live") parts.push(`Test data: ${DATA_LABELS[data]}. The page shows simulated data; switch Data back to Live when done.`);
+  $("#banner").hidden = !parts.length;
+  $("#banner").textContent = parts.join("  ·  ");
+}
+
+function sendPins() {
+  state.canvas?.setPins(state.questions.filter((q) => q.route === state.route).map(({ n, id, text }) => ({ n, id, text })));
 }
 
 async function loadTheme() {
@@ -178,16 +201,143 @@ async function edit(body, label) {
   refreshChanges();
 }
 
-async function themeEdit(path, value, label) {
-  try {
-    const r = await api("theme", { path, value, label });
-    toast(r.changed ? label : "No change");
-  } catch (e) {
-    toast(e.message, true);
+// Theme edits are previewed first: Mantine's CSS variables are overridden in
+// the page (where a change maps to one), the reach is counted in the source,
+// and nothing is written until Apply.
+function themeEdit(path, value, label) {
+  const key = path.join(".");
+  const item = { path, value, label, vars: previewVars(path, value), reach: null };
+  state.pending = [...state.pending.filter((p) => p.path.join(".") !== key), item];
+  applyPreview();
+  renderPanel();
+  const q = reachQuery(path);
+  if (q) {
+    api(`usage?kind=${q.kind}&name=${encodeURIComponent(q.name)}`)
+      .then((r) => { item.reach = { ...r, note: q.note }; renderPanel(); })
+      .catch((e) => { item.reach = { error: e.message }; renderPanel(); });
+  } else {
+    item.reach = { note: "Affects every page" };
   }
+}
+
+function applyPreview() {
+  state.canvas?.setPreviewVars(Object.assign({}, ...state.pending.map((p) => p.vars ?? {})));
+}
+
+async function applyPending() {
+  const items = state.pending;
+  state.pending = [];
+  let ok = 0;
+  for (const p of items) {
+    try {
+      const r = await api("theme", { path: p.path, value: p.value, label: p.label });
+      if (r.changed) ok++;
+    } catch (e) {
+      toast(`${p.label}: ${e.message}`, true);
+    }
+  }
+  applyPreview();
+  if (ok) toast(ok === 1 ? items[0].label : `Applied ${ok} theme changes`);
   await loadTheme();
   renderPanel();
   refreshChanges();
+}
+
+function discardPending() {
+  state.pending = [];
+  applyPreview();
+  renderPanel();
+}
+
+/** A previewed (not yet applied) value for a theme path, if any. */
+function pendingFor(path) {
+  const key = path.join(".");
+  return state.pending.find((p) => p.path.join(".") === key);
+}
+
+function themeGet(key) {
+  return state.theme?.leaves?.find((l) => l.path.join(".") === key)?.value;
+}
+
+/** Mantine CSS variables that preview a theme change, or null if none can. */
+function previewVars(path, value) {
+  const key = path.join(".");
+  const primary = themeGet("primaryColor");
+  const shade = typeof themeGet("primaryShade") === "number" ? themeGet("primaryShade") : 6;
+  const rem = (px) => `calc(${px / 16}rem * var(--mantine-scale))`;
+  const v = {};
+  if (path[0] === "colors" && path.length === 3 && typeof value === "string") {
+    const [, ramp, i] = path;
+    const names = [ramp, ...(state.theme?.leaves ?? []).filter((l) => l.kind === "alias" && l.value === ramp).map((l) => l.path[1])];
+    for (const n of names) {
+      v[`--mantine-color-${n}-${i}`] = value;
+      if (i === shade) v[`--mantine-color-${n}-filled`] = value;
+      if (i === Math.min(shade + 1, 9)) v[`--mantine-color-${n}-filled-hover`] = value;
+    }
+    if (ramp === primary) {
+      v[`--mantine-primary-color-${i}`] = value;
+      if (i === shade) v["--mantine-primary-color-filled"] = value;
+      if (i === Math.min(shade + 1, 9)) v["--mantine-primary-color-filled-hover"] = value;
+    }
+  } else if (key === "primaryShade" && typeof value === "number" && primary) {
+    const c = (i) => `var(--mantine-color-${primary}-${i})`;
+    Object.assign(v, {
+      "--mantine-primary-color-filled": c(value), "--mantine-primary-color-filled-hover": c(Math.min(value + 1, 9)),
+      [`--mantine-color-${primary}-filled`]: c(value), [`--mantine-color-${primary}-filled-hover`]: c(Math.min(value + 1, 9)),
+    });
+  } else if (key === "primaryColor" && typeof value === "string") {
+    for (let i = 0; i < 10; i++) v[`--mantine-primary-color-${i}`] = `var(--mantine-color-${value}-${i})`;
+    Object.assign(v, {
+      "--mantine-primary-color-filled": `var(--mantine-color-${value}-${shade})`,
+      "--mantine-primary-color-filled-hover": `var(--mantine-color-${value}-${Math.min(shade + 1, 9)})`,
+      "--mantine-primary-color-light": `var(--mantine-color-${value}-light)`,
+      "--mantine-primary-color-light-hover": `var(--mantine-color-${value}-light-hover)`,
+      "--mantine-primary-color-light-color": `var(--mantine-color-${value}-light-color)`,
+    });
+  } else if (["spacing", "radius", "fontSizes"].includes(path[0]) && path.length === 2 && typeof value === "number") {
+    const name = { spacing: "spacing", radius: "radius", fontSizes: "font-size" }[path[0]];
+    v[`--mantine-${name}-${path[1]}`] = rem(value);
+  } else if (key === "defaultRadius") {
+    v["--mantine-radius-default"] = typeof value === "number" ? rem(value) : `var(--mantine-radius-${value})`;
+  } else if (key === "fontFamily") v["--mantine-font-family"] = value;
+  else if (key === "fontFamilyMonospace") v["--mantine-font-family-monospace"] = value;
+  else if (key === "headings.fontFamily") v["--mantine-font-family-headings"] = value;
+  else if (key === "headings.fontWeight") v["--mantine-heading-font-weight"] = value;
+  else return null;
+  return v;
+}
+
+/** What to count in the source to show a theme change's reach. */
+function reachQuery(path) {
+  const [group, a] = path;
+  if (group === "colors") return { kind: "color", name: a };
+  if (group === "spacing") return { kind: "spacing", name: a };
+  if (group === "radius") return { kind: "radius", name: a };
+  if (group === "fontSizes") return { kind: "fontSize", name: a };
+  if (group === "components") return { kind: "component", name: a };
+  if (group === "primaryColor" || group === "primaryShade") {
+    const primary = themeGet("primaryColor");
+    return primary ? { kind: "color", name: primary, note: "plus every button, link and highlight that uses the primary colour by default" } : null;
+  }
+  return null;
+}
+
+function pendingBar() {
+  if (!state.pending.length) return null;
+  const reach = (r) => {
+    if (!r) return "counting where it's used…";
+    if (r.error) return `couldn't count uses: ${r.error}`;
+    if (r.count === undefined) return r.note;
+    const base = r.count ? `used in ${r.count} place${r.count === 1 ? "" : "s"} across ${r.files.length} file${r.files.length === 1 ? "" : "s"}` : "not referenced by name in the code";
+    return r.note ? `${base}, ${r.note}` : base;
+  };
+  return h("div", { class: "pending" },
+    h("h3", {}, `Previewing ${state.pending.length} theme change${state.pending.length === 1 ? "" : "s"}`),
+    h("ul", {}, ...state.pending.map((p) => h("li", {}, p.label,
+      h("div", { class: "reach" }, reach(p.reach), p.vars ? "" : " · no live preview for this one; Apply to see it")))),
+    h("div", { class: "btnrow" },
+      h("button", { class: "primary", onclick: applyPending }, "Apply"),
+      h("button", { class: "btn", onclick: discardPending }, "Discard")));
 }
 
 async function revert(n) {
@@ -207,6 +357,29 @@ async function revert(n) {
   renderLayers();
 }
 
+async function redo() {
+  try {
+    toast(`Redone: ${(await api("redo", {})).redone}`);
+  } catch (e) {
+    toast(e.message, true);
+  }
+  await loadTheme();
+  await refreshChanges();
+  await refreshInfo();
+  renderLayers();
+}
+
+// Arrow-key nudges arrive from the canvas as a computed-margin delta. A
+// result that lands on a spacing token is written as the token.
+async function nudge({ dx, dy, baseLeft, baseTop, label }) {
+  const scale = tokens("spacing");
+  const asToken = (px) => (px === 0 ? 0 : Object.entries(scale).find(([, v]) => v === px)?.[0] ?? px);
+  if (dy) await edit({ type: "prop", name: "mt", value: asToken(baseTop + dy) }, `${label}: margin top → ${baseTop + dy}px (nudged)`);
+  if (dx) await edit({ type: "prop", name: "ml", value: asToken(baseLeft + dx) }, `${label}: margin left → ${baseLeft + dx}px (nudged)`);
+}
+
+function showHelp(open = true) { $("#help").hidden = !open; }
+
 // ---------- canvas bridge ----------
 
 let layersTimer = null;
@@ -215,6 +388,8 @@ window.__veShell = {
     state.canvas = canvas;
     canvas.setMode(state.mode);
     canvas.setSelection(state.sel);
+    applyPreview();
+    sendPins();
     renderLayers();
     if (state.sel) refreshInfo(); else renderPanel();
   },
@@ -226,6 +401,10 @@ window.__veShell = {
   edit,
   getInfo: () => state.info,
   undo: () => revert(),
+  redo,
+  nudge,
+  help: (open = true) => showHelp(open),
+  helpOpen: () => !$("#help").hidden,
   status: (text, err) => toast(text, err),
   // The page re-rendered (hot reload, navigation, data arriving): refresh
   // what is read from the DOM, but never under someone typing in the panel.
@@ -235,7 +414,8 @@ window.__veShell = {
       renderLayers();
       const typing = $("#panel").contains(document.activeElement) &&
         /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
-      if (state.tab === "design" && !typing && $("#popover").hidden) renderPanel();
+      if ((state.tab === "design" || state.tab === "checks") && !typing && $("#popover").hidden) renderPanel();
+      else refreshCheckCount();
     }, 100);
   },
   routeChanged(route) {
@@ -244,6 +424,7 @@ window.__veShell = {
     // (e.g. after a theme edit) keeps the selection.
     if (state.route && route !== state.route && state.sel) select(null);
     state.route = route;
+    sendPins();
   },
   spaceHeld(held) {
     $("#stage").style.outline = held ? "2px solid #f59e0b" : "";
@@ -337,6 +518,8 @@ function propSource() {
     const leaves = state.theme?.leaves ?? [];
     return {
       get(prop) {
+        const p = pendingFor([...prefix, prop]);
+        if (p) return p.value === null ? undefined : { value: p.value };
         const l = leaves.find((x) => x.path.length === 4 && prefix.every((k, i) => x.path[i] === k) && x.path[3] === prop);
         if (!l) return undefined;
         return l.kind === "computed" || l.kind === "alias" ? { computed: l.source ?? l.value } : { value: l.value };
@@ -481,8 +664,11 @@ function sizeControl(src, prop, label, dimension) {
         else src.set(prop, rendered(), label);
       },
     }, l)));
+  const warn = dimension === "w" && typeof value === "number" && value > 390
+    ? h("div", { class: "warn" }, `Fixed ${value}px is wider than a phone (390px) and will overflow small screens. Try Fill with a Max width.`)
+    : null;
   return field(label, h("div", { class: "ctl" }, seg, px, h("span", { class: "unit", hidden: px.hidden }, "px")),
-    { over: src.overridden(prop) });
+    { over: src.overridden(prop), warn });
 }
 
 function swatch(value) {
@@ -668,6 +854,49 @@ function rawPropRow(attr) {
   return field(attr.name, h("div", { class: "ctl" }, input));
 }
 
+function askButton(text) {
+  const b = h("button", { class: "linkish", "data-popover": true }, text);
+  b.addEventListener("click", () => {
+    const label = selLabel();
+    const area = h("textarea", { class: "textbox", rows: 4, placeholder: `What should change about ${label}?` });
+    const sendQ = h("button", { class: "primary", style: "margin-top:8px;width:100%" }, "Add question");
+    sendQ.addEventListener("click", async () => {
+      if (!area.value.trim()) { area.focus(); return; }
+      try {
+        await api("questions", { id: state.sel.id, label, route: state.route, text: area.value });
+        toast("Question saved; it goes to the developer with Send for review");
+        closePopover();
+        refreshChanges();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    });
+    openPopover(b, h("div", {},
+      h("div", { style: "font-weight:600;margin-bottom:4px" }, `Ask a developer about ${label}`),
+      h("div", { class: "note" }, "For things the editor can't change. It's pinned to this element and sent with your review."),
+      area, sendQ));
+    setTimeout(() => area.focus(), 0);
+  });
+  return b;
+}
+
+function accessibilitySection() {
+  const c = state.sel && state.canvas?.elementChecks(state.sel);
+  if (!c || (!c.text && !c.target)) return null;
+  const rows = [];
+  const row = (label, value, good) => h("div", { class: "a11y-row" },
+    h("span", {}, label), h("span", { class: good ? "ok" : "badge" }, value));
+  if (c.text?.ratio) {
+    rows.push(row("Text contrast", `${c.text.ratio}:1 ${c.text.ratio >= c.text.required ? "✓ AA" : `· needs ${c.text.required}:1`}`, c.text.ratio >= c.text.required));
+  }
+  if (c.text) rows.push(row("Text size", `${Math.round(c.text.size * 10) / 10}px${c.text.size < 12 ? " · small" : ""}`, c.text.size >= 12));
+  if (c.target) {
+    const okT = c.target.width >= 24 && c.target.height >= 24;
+    rows.push(row("Click target", `${c.target.width}×${c.target.height}${okT ? " ✓" : " · aim for 24×24"}`, okT));
+  }
+  return h("section", {}, h("h3", {}, "Accessibility"), ...rows);
+}
+
 function renderDesign(panel) {
   const info = state.info;
   if (!state.sel) {
@@ -685,7 +914,8 @@ function renderDesign(panel) {
     h("div", { class: "sub" },
       info.mantine ? `${info.name} component` : /^[a-z]/.test(info.name) ? `HTML <${info.name}>` : `Custom component <${info.name}>`,
       d?.count > 1 ? ` · repeated ×${d.count} (edits change all)` : "",
-      " · ", h("button", { class: "linkish", onclick: () => window.__veShell.selectParent() }, "Select parent ↑"))));
+      " · ", h("button", { class: "linkish", onclick: () => window.__veShell.selectParent() }, "Select parent ↑"),
+      " · ", askButton("Ask a developer"))));
 
   if (info.mantine) {
     const onPage = state.canvas?.countByName(info.name) ?? 0;
@@ -711,7 +941,7 @@ function renderDesign(panel) {
         edit({ type: "text", value: input.value }, `${selLabel()}: text → “${input.value.trim()}”`));
       content.push(input, h("div", { class: "note" }, "Or double-click the text on the page."));
     } else if (t.source) {
-      content.push(h("div", { class: "lock" }, "🔒 Filled in by the app (", h("code", {}, t.source), ")"));
+      content.push(h("div", { class: "lock" }, "🔒 Filled in by the app (", h("code", {}, t.source), ") · ", askButton("Ask to change it")));
     } else if (t.reason === "mixed content" || t.reason === "contains elements") {
       content.push(h("div", { class: "note" }, "Contains other elements — select one of them to edit its text."));
     }
@@ -730,7 +960,7 @@ function renderDesign(panel) {
           h("div", { class: "note" }, `${mv.index + 1} of ${mv.order.length} in its container. Drag on the page to reorder; hold ⌘ while dragging to move into another container.`),
         ]
         : h("div", { class: "lock" }, mv.reason.includes("list")
-          ? "🔒 Part of a list the app builds from data — the order comes from code."
+          ? ["🔒 Part of a list the app builds from data — the order comes from code. ", askButton("Ask a developer")]
           : "🔒 This is the outer frame of a component; move it where it's used.")));
   }
 
@@ -742,6 +972,8 @@ function renderDesign(panel) {
   } else {
     const { out, used } = sections(info.name);
     panel.append(...out);
+    const a11y = accessibilitySection();
+    if (a11y && state.scope === "instance") panel.append(a11y);
     if (state.scope === "instance") {
       const rest = info.attrs.filter((a) => !used.has(a.name));
       if (rest.length) {
@@ -761,13 +993,15 @@ function themeValueInput(leaf, label, { removable = false } = {}) {
   if (leaf.kind === "computed" || leaf.kind === "alias") {
     return field(label, leaf.kind === "alias" ? h("div", { class: "note" }, `Same as ${leaf.value}`) : locked(leaf.source));
   }
-  const input = h("input", { type: leaf.kind === "rem" || leaf.kind === "number" ? "number" : "text", value: String(leaf.value) });
+  const p = pendingFor(leaf.path);
+  const input = h("input", { type: leaf.kind === "rem" || leaf.kind === "number" ? "number" : "text", value: String(p ? p.value ?? "" : leaf.value) });
   input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
   input.addEventListener("change", () => {
     const raw = input.value.trim();
     if (raw === "" && !removable) { input.value = String(leaf.value); toast("Theme values can't be empty", true); return; }
     const value = raw === "" ? null : leaf.kind === "string" ? raw : Number.isFinite(Number(raw)) ? Number(raw) : raw;
-    themeEdit(leaf.path, value, `Theme: ${label} ${show(leaf.value)} → ${show(value)}`);
+    const name = THEME_LABELS[leaf.path.join(".")] ?? leaf.path.filter((k) => k !== "defaultProps").join(" ");
+    themeEdit(leaf.path, value, `Theme: ${name} ${show(leaf.value)} → ${show(value)}`);
   });
   return field(label, h("div", { class: "ctl" }, input, leaf.kind === "rem" || leaf.kind === "em" ? h("span", { class: "unit" }, "px") : null));
 }
@@ -809,14 +1043,14 @@ function renderTheme(panel) {
   const pc = leaves.find((l) => l.path.join(".") === "primaryColor");
   if (pc) {
     const sel = h("select", {}, ...[...ramps().keys()].map((n) => h("option", { value: n }, n)));
-    sel.value = pc.value;
+    sel.value = pendingFor(pc.path)?.value ?? pc.value;
     sel.addEventListener("change", () => themeEdit(pc.path, sel.value, `Theme: primary colour ${pc.value} → ${sel.value}`));
     brand.append(...field("Primary colour", h("div", { class: "ctl" }, sel)));
   }
   const ps = leaves.find((l) => l.path.join(".") === "primaryShade");
   if (ps && typeof ps.value === "number") {
     const sel = h("select", {}, ...[...Array(10).keys()].map((i) => h("option", { value: i }, String(i))));
-    sel.value = String(ps.value);
+    sel.value = String(pendingFor(ps.path)?.value ?? ps.value);
     sel.addEventListener("change", () => themeEdit(ps.path, Number(sel.value), `Theme: primary shade ${ps.value} → ${sel.value}`));
     brand.append(...field("Primary shade", h("div", { class: "ctl" }, sel)));
   }
@@ -842,6 +1076,7 @@ function renderTheme(panel) {
     }
     panel.append(s);
   }
+  panel.append(figmaSection(leaves));
   const other = leaves.filter((l) => !used.has(l));
   if (other.length) {
     panel.append(h("details", {}, h("summary", {}, `Other theme values (${other.length})`),
@@ -856,19 +1091,123 @@ function ago(ts) {
   return s < 60 ? "just now" : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
 }
 
+function figmaSection(leaves) {
+  const s = h("section", {}, h("h3", {}, "Compare with Figma"));
+  const file = h("input", { type: "file", accept: ".json,application/json" });
+  file.addEventListener("change", async () => {
+    const f = file.files[0];
+    if (!f) return;
+    try {
+      const { flattenTokens } = await import("/__ve/tokens.js");
+      const tokens = flattenTokens(JSON.parse(await f.text()));
+      if (!tokens.length) throw new Error("no tokens found in that file");
+      state.figma = { name: f.name, tokens };
+    } catch (e) {
+      toast(`Couldn't read ${f.name}: ${e.message}`, true);
+    }
+    renderPanel();
+  });
+  if (!state.figma) {
+    s.append(h("div", { class: "note" },
+      "Export your Figma variables or tokens as JSON (Variables export, Tokens Studio or W3C format) and pick the file to see where the app and Figma differ."), file);
+    return s;
+  }
+  const holder = h("div", {}, h("div", { class: "note" }, `Comparing with ${state.figma.name}…`));
+  s.append(holder);
+  import("/__ve/tokens.js").then(({ compareTokens }) => {
+    const r = compareTokens(state.figma.tokens, leaves);
+    holder.replaceChildren(
+      h("div", { class: "note" }, `${state.figma.name}: ${r.same} of ${r.checked} theme values match Figma`,
+        r.diffs.length ? `, ${r.diffs.length} differ` : "",
+        r.missingInFigma.length ? `, ${r.missingInFigma.length} aren't in Figma` : "",
+        ". ", h("button", { class: "linkish", onclick: () => { state.figma = null; renderPanel(); } }, "Clear")),
+      ...r.diffs.map((d) => {
+        const isColor = d.path[0] === "colors";
+        const label = isColor ? `${d.path[1]} ${d.path[2]}` : d.path.join(" ");
+        return h("div", { class: "figma-row" },
+          h("div", {}, h("div", {}, label),
+            h("div", { class: "vals" },
+              "app", isColor ? swatch(d.code) : null, h("span", { class: "mono" }, show(d.code)),
+              "· Figma", isColor ? swatch(d.figma) : null, h("span", { class: "mono" }, show(d.figma)))),
+          h("button", {
+            class: "btn",
+            onclick: () => themeEdit(d.path, d.figma, `Theme: ${label} ${show(d.code)} → ${show(d.figma)} (from Figma)`),
+          }, "Use Figma"));
+      }),
+      r.missingInFigma.length ? h("details", {}, h("summary", {}, `Not in Figma (${r.missingInFigma.length})`),
+        h("div", { class: "mono" }, r.missingInFigma.join(", "))) : "");
+  }).catch((e) => holder.replaceChildren(h("div", { class: "note" }, `Comparison failed: ${e.message}`)));
+  return s;
+}
+
+function refreshCheckCount() {
+  try {
+    state.checks = state.canvas?.checks() ?? [];
+  } catch (e) {
+    state.checks = [];
+    console.error("[visual-edit] page checks failed", e);
+  }
+  renderTabs();
+}
+
+const CHECK_GROUPS = [
+  ["overflow", "Sticks out at this width"],
+  ["contrast", "Low text contrast"],
+  ["small-text", "Small text"],
+  ["target", "Small click targets"],
+];
+
+function renderChecks(panel) {
+  refreshCheckCount();
+  const width = state.canvas?.viewportWidth();
+  panel.append(h("div", { class: "head" }, h("h2", {}, "Checks"),
+    h("div", { class: "sub" }, `Accessibility (WCAG AA) and layout problems on this page${width ? ` at ${width}px wide` : ""}. Click one to select it.`)));
+  if (!state.checks.length) {
+    panel.append(h("div", { class: "empty" }, "No problems found on this page. Try other widths and data states too."));
+    return;
+  }
+  for (const [kind, title] of CHECK_GROUPS) {
+    const items = state.checks.filter((c) => c.kind === kind);
+    if (!items.length) continue;
+    panel.append(h("section", {}, h("h3", {}, `${title} (${items.length})`),
+      ...items.map((c) => h("div", {
+        class: "issue",
+        onclick: () => select(c.ref),
+        onmouseenter: () => state.canvas?.setLayerHover(c.ref),
+        onmouseleave: () => state.canvas?.setLayerHover(null),
+      }, h("div", {}, c.label), h("div", { class: "msg" }, c.message)))));
+  }
+}
+
 function renderChanges(panel) {
   panel.append(h("div", { class: "head" }, h("h2", {}, "Your changes"),
     h("div", { class: "sub" }, "Everything you've changed this session. Revert any one of them.")));
   if (state.review) {
     const r = state.review;
     panel.append(h("div", { class: "result" },
-      h("strong", {}, `Sent ${r.sent} change${r.sent === 1 ? "" : "s"} for review`), h("br"),
+      h("strong", {}, `Sent ${[
+        r.sent ? `${r.sent} change${r.sent === 1 ? "" : "s"}` : "",
+        r.asked ? `${r.asked} question${r.asked === 1 ? "" : "s"}` : "",
+      ].filter(Boolean).join(" and ")} for review`), h("br"),
       "Branch ", h("code", {}, r.branch), " · commit ", h("code", {}, r.commit), h("br"),
       r.prUrl ? h("a", { href: r.prUrl, target: "_blank" }, "Open pull request")
         : r.pushed ? "Pushed." : h("span", {}, "Saved on this machine. A developer can publish it with ",
           h("code", {}, `git push -u origin ${r.branch}`), ".")));
   }
-  if (!state.changes.length) {
+  if (state.questions.length) {
+    panel.append(h("section", {}, h("h3", {}, `Questions for developers (${state.questions.length})`),
+      ...state.questions.map((q) => h("div", { class: "question" },
+        h("div", {}, h("strong", {}, `#${q.n} ${q.label}: `), q.text),
+        h("button", {
+          class: "btn danger",
+          onclick: async () => {
+            try { await api("questions-delete", { n: q.n }); } catch (e) { toast(e.message, true); }
+            refreshChanges();
+          },
+        }, "Delete"),
+        h("div", { class: "when" }, `${ago(q.at)} · page ${q.route}`)))));
+  }
+  if (!state.changes.length && !state.questions.length) {
     panel.append(h("div", { class: "empty" }, "No changes yet."));
     return;
   }
@@ -903,7 +1242,7 @@ function renderChanges(panel) {
       `${dirty.join(", ")} already had other unsaved edits before this session. They'll be included; ask a developer if that's unexpected.`) : null,
     h("div", { class: "note" }, state.config.allowPush
       ? "Commits these changes to a new branch, pushes it and opens a pull request."
-      : "Commits these changes to a new branch for a developer to review."),
+      : "Commits these changes (and questions) to a new branch for a developer to review."),
     title, h("div", { style: "height:6px" }), notes, send));
 }
 
@@ -912,7 +1251,8 @@ function renderChanges(panel) {
 function renderTabs() {
   for (const b of document.querySelectorAll(".tabs button")) {
     b.classList.toggle("on", b.dataset.tab === state.tab);
-    if (b.dataset.tab === "changes") b.textContent = `Changes${state.changes.length ? ` (${state.changes.length})` : ""}`;
+    const n = { changes: state.changes.length + state.questions.length, checks: state.checks.length }[b.dataset.tab];
+    if (n !== undefined) b.textContent = `${b.dataset.tab[0].toUpperCase()}${b.dataset.tab.slice(1)}${n ? ` (${n})` : ""}`;
   }
 }
 
@@ -921,7 +1261,10 @@ function renderPanel() {
   const panel = $("#panel");
   const scroll = panel.parentElement.scrollTop;
   panel.replaceChildren();
+  const bar = pendingBar();
+  if (bar) panel.append(bar);
   if (state.tab === "theme") renderTheme(panel);
+  else if (state.tab === "checks") renderChecks(panel);
   else if (state.tab === "changes") renderChanges(panel);
   else {
     if (state.scope === "component" && !state.theme) {
@@ -986,10 +1329,14 @@ $("#demo").addEventListener("click", async () => {
   }
 });
 
+const isTextField = (a) => a?.isContentEditable || /^(TEXTAREA|SELECT)$/.test(a?.tagName ?? "") ||
+  (a?.tagName === "INPUT" && !/^(checkbox|radio|button|submit|reset|range|color|file)$/.test(a.type));
+
 document.addEventListener("keydown", (e) => {
-  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? "");
-  if (typing) return;
-  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !e.shiftKey) { e.preventDefault(); revert(); }
+  if (isTextField(document.activeElement)) return;
+  if (e.key === "Escape" && !$("#help").hidden) { showHelp(false); return; }
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") { e.preventDefault(); if (e.shiftKey) redo(); else revert(); }
+  else if (e.key === "?") showHelp(true);
   else if (e.key === "Escape") { closePopover(); if (state.sel) window.__veShell.selectParent(); }
 });
 
@@ -997,6 +1344,26 @@ document.addEventListener("keydown", (e) => {
 
 document.body.append(h("datalist", { id: "ve-space" },
   ...["0", "xs", "sm", "md", "lg", "xl"].map((t) => h("option", { value: t }))));
+
+$("#helpbtn").addEventListener("click", () => showHelp(true));
+$("#helpclose").addEventListener("click", () => showHelp(false));
+$("#help").addEventListener("click", (e) => { if (e.target.id === "help") showHelp(false); });
+
+$("#data").addEventListener("change", (e) => {
+  try {
+    sessionStorage.setItem("ve-data-state", e.target.value);
+  } catch (err) {
+    toast(`Couldn't switch test data: ${err.message}`, true);
+    return;
+  }
+  renderBanner();
+  frame.contentWindow.location.reload();
+});
+try {
+  $("#data").value = sessionStorage.getItem("ve-data-state") || "live";
+} catch (e) {
+  console.warn("[visual-edit] couldn't read the test-data state", e);
+}
 
 (async () => {
   try {

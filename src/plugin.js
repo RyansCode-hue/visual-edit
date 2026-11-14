@@ -19,13 +19,16 @@ import { fileURLToPath } from "node:url";
 import { stampJsx, inspect, applyEdit, applyMove, parseSource, EditError } from "./source.js";
 import { readTheme, setThemeValue, isMantineComponent } from "./theme.js";
 import { revertChange, slug } from "./changes.js";
+import { countUsage } from "./usage.js";
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const CANVAS_URL = "/@visual-edit/canvas.js";
+const DATA_URL = "/@visual-edit/data.js";
 const STATIC = {
   "": [here("./shell/index.html"), "text/html"],
   "shell.js": [here("./shell/shell.js"), "text/javascript"],
   "shell.css": [here("./shell/shell.css"), "text/css"],
+  "tokens.js": [here("./shell/tokens.js"), "text/javascript"],
 };
 const API = "/__ve/";
 const MAX_BODY = 64 * 1024;
@@ -132,8 +135,15 @@ export default function visualEdit(opts = {}) {
     }
   }
 
-  function record(abs, rel, before, after, { id = null, label }) {
+  // Reverted changes, newest last, for redo. Any new edit clears it.
+  const redo = [];
+  // Questions for developers, pinned to elements: { n, id, label, route, text, at }.
+  const questions = [];
+  let questionSeq = 0;
+
+  function record(abs, rel, before, after, { id = null, label, keepRedo = false }) {
     if (!originals.has(abs)) originals.set(abs, before);
+    if (!keepRedo) redo.length = 0;
     changes.push({ n: ++seq, abs, rel, id, label, before, after, at: Date.now() });
     if (changes.length > MAX_CHANGES) changes.shift();
     log(`#${seq} ${label}  (${rel})`);
@@ -179,9 +189,30 @@ export default function visualEdit(opts = {}) {
 
   const git = (args) => execFileAsync("git", args, { cwd: root });
 
+  // Source files for usage counts, cached briefly: one panel render asks
+  // several questions in a row.
+  let sourceCache = null;
+  async function listSources() {
+    if (sourceCache && Date.now() - sourceCache.at < 5000) return sourceCache.files;
+    const files = [];
+    const scan = async (dir) => {
+      for (const ent of await fs.readdir(dir, { withFileTypes: true })) {
+        if (ent.name.startsWith(".") || ["node_modules", "dist", "build", "tests"].includes(ent.name)) continue;
+        const abs = path.join(dir, ent.name);
+        if (ent.isDirectory()) await scan(abs);
+        else if (/\.[jt]sx?$/.test(ent.name)) {
+          files.push({ rel: path.relative(root, abs).split(path.sep).join("/"), code: await fs.readFile(abs, "utf8") });
+        }
+      }
+    };
+    await scan(root);
+    sourceCache = { at: Date.now(), files };
+    return files;
+  }
+
   async function sendForReview({ title, notes }) {
     assertEditable();
-    if (!changes.length) throw new EditError("No changes to send", 409);
+    if (!changes.length && !questions.length) throw new EditError("Nothing to send yet", 409);
     const t = cleanLabel(title, null);
     if (!t) throw new EditError("Give the change a short title");
     const files = [...new Set(changes.map((c) => c.abs))];
@@ -191,20 +222,24 @@ export default function visualEdit(opts = {}) {
     const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
     const branch = `design/${slug(t)}-${stamp}`;
     const body = [
-      "Design changes made with the visual editor:",
-      "",
-      ...changes.map((c) => `- ${c.label}`),
+      ...(changes.length ? ["Design changes made with the visual editor:", "", ...changes.map((c) => `- ${c.label}`)] : []),
+      ...(questions.length ? [
+        ...(changes.length ? [""] : []),
+        "Questions for developers:", "",
+        ...questions.map((q) => `- ${q.label} (${q.id.replace(/:\d+$/, "")}, page ${q.route}): ${q.text}`),
+      ] : []),
       ...(cleanLabel(notes, null) ? ["", cleanLabel(notes, "")] : []),
     ].join("\n");
 
     await git(["switch", "-c", branch]);
     try {
-      await git(["add", "--", ...files]);
-      await git(["commit", "-m", `${t}\n\n${body}\n`]);
+      if (files.length) await git(["add", "--", ...files]);
+      // Questions alone still get a branch, so a developer has one place to look.
+      await git(["commit", ...(files.length ? [] : ["--allow-empty"]), "-m", `${t}\n\n${body}\n`]);
     } catch (e) {
       // Leave the repo as it was: back to the previous branch, no empty branch.
       log(`commit failed, returning to ${prevBranch}: ${e.stderr?.trim() || e.message}`);
-      await git(["reset", "-q", "--", ...files]).catch((r) => log(`reset failed: ${r.message}`));
+      if (files.length) await git(["reset", "-q", "--", ...files]).catch((r) => log(`reset failed: ${r.message}`));
       await git(["switch", "-q", prevBranch]);
       await git(["branch", "-D", branch]);
       throw e;
@@ -221,10 +256,13 @@ export default function visualEdit(opts = {}) {
       prUrl = pr.stdout.trim().split("\n").pop();
     }
     const sent = changes.length;
+    const asked = questions.length;
     changes.length = 0;
+    questions.length = 0;
+    redo.length = 0;
     originals.clear();
     dirtyBefore.clear();
-    return { branch, commit, files: files.map((f) => path.relative(root, f)), sent, pushed, prUrl };
+    return { branch, commit, files: files.map((f) => path.relative(root, f)), sent, asked, pushed, prUrl };
   }
 
   async function demoLogin(res) {
@@ -345,6 +383,7 @@ export default function visualEdit(opts = {}) {
       await fs.writeFile(c.abs, out, "utf8");
       const newestForFile = !changes.slice(i + 1).some((x) => x.abs === c.abs);
       changes.splice(i, 1);
+      redo.push(c);
       if (!changes.some((x) => x.abs === c.abs) && out === originals.get(c.abs)) {
         originals.delete(c.abs);
         dirtyBefore.delete(c.abs);
@@ -361,6 +400,52 @@ export default function visualEdit(opts = {}) {
       log(showOriginal ? "showing original" : "showing current version");
       reloadTouched();
       return send(res, 200, { showOriginal });
+    }
+
+    if (route === "redo") {
+      assertEditable();
+      const c = redo.pop();
+      if (!c) throw new EditError("Nothing to redo", 409);
+      const current = await fs.readFile(c.abs, "utf8");
+      const out = revertChange(current, { before: c.after, after: c.before });
+      parseSource(out, c.rel);
+      await fs.writeFile(c.abs, out, "utf8");
+      record(c.abs, c.rel, current, out, { id: c.id, label: c.label, keepRedo: true });
+      return send(res, 200, { redone: c.label });
+    }
+
+    if (isGet && route === "usage") {
+      const q = new URL(req.url, "http://x").searchParams;
+      const themeFile = q.get("kind") === "component" ? null : await findThemeFile().catch(() => null);
+      const files = (await listSources()).filter((f) => f.rel !== themeFile);
+      const result = countUsage(files, q.get("kind"), q.get("name"));
+      if (!result) throw new EditError("Bad usage query");
+      return send(res, 200, result);
+    }
+
+    if (isGet && route === "questions") {
+      return send(res, 200, { questions });
+    }
+
+    if (route === "questions") {
+      const { id, label, route: page, text } = await readBody(req);
+      parseId(id);
+      const t = cleanLabel(text, null);
+      if (!t) throw new EditError("Write the question first");
+      questions.push({
+        n: ++questionSeq, id, label: cleanLabel(label, id), route: cleanLabel(page, "/"),
+        text: String(text).trim().slice(0, 2000), at: Date.now(),
+      });
+      log(`question #${questionSeq} on ${id}: ${t}`);
+      return send(res, 200, { n: questionSeq });
+    }
+
+    if (route === "questions-delete") {
+      const { n } = await readBody(req);
+      const i = questions.findIndex((q) => q.n === n);
+      if (i < 0) throw new EditError("No such question", 404);
+      questions.splice(i, 1);
+      return send(res, 200, { deleted: n });
     }
 
     if (route === "review") {
@@ -400,21 +485,21 @@ export default function visualEdit(opts = {}) {
     },
 
     transformIndexHtml() {
-      return [{
-        tag: "script",
-        attrs: { type: "module", src: CANVAS_URL },
-        injectTo: "body",
-      }];
+      return [
+        // Classic and first in <head>: wraps fetch before the app's modules run.
+        { tag: "script", attrs: { src: DATA_URL }, injectTo: "head-prepend" },
+        { tag: "script", attrs: { type: "module", src: CANVAS_URL }, injectTo: "body" },
+      ];
     },
 
     configureServer(s) {
       server = s;
       server.middlewares.use(async (req, res, next) => {
         const url = req.url ?? "";
-        if (url === CANVAS_URL) {
+        if (url === CANVAS_URL || url === DATA_URL) {
           res.setHeader("Content-Type", "text/javascript");
           res.setHeader("Cache-Control", "no-store");
-          res.end(await fs.readFile(here("./canvas.js"), "utf8"));
+          res.end(await fs.readFile(here(url === CANVAS_URL ? "./canvas.js" : "./data.js"), "utf8"));
           return;
         }
         if (url === "/__ve") {
