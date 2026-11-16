@@ -6,6 +6,8 @@
 // Inspector controls speak design vocabulary and offer design-system tokens;
 // raw Mantine props stay under "More properties" and "Developer info".
 
+import { toPx, primaryColorVars } from "/__ve/mantine-vars.js";
+
 const $ = (s, root = document) => root.querySelector(s);
 const h = (tag, props = {}, ...kids) => {
   const el = document.createElement(tag);
@@ -119,8 +121,38 @@ const show = (v) => (v === undefined || v === null ? "default" : typeof v === "n
 
 const selLabel = () => (state.sel && state.canvas?.describe(state.sel)?.label) || state.info?.name || "Element";
 
+// URL mode: the editor was opened on a live site, not the app's code. Elements
+// come from the DOM (stamp-dom.js), and changes are kept as style and text
+// overrides that end up in a handoff instead of in the code.
+const urlMode = () => state.config?.mode === "url";
+const dom = () => frame.contentWindow?.__veDom ?? null;
+const NO_MOVE = "moving needs the code; open the editor on the app folder to reorder things";
+
+function urlInfo(s) {
+  const d = dom()?.describe(s.id);
+  return d ? { ...d, move: { movable: false, reason: NO_MOVE } } : null;
+}
+
+async function applyOverrides() {
+  if (!urlMode()) return;
+  try {
+    const r = await api("overrides");
+    state.urlTheme = r.themeVars;
+    dom()?.setOverrides(r.overrides, r.themeVars);
+  } catch (e) {
+    toast(`Couldn't apply your changes to the page: ${e.message}`, true);
+  }
+}
+
 async function refreshInfo() {
   if (!state.sel) { state.info = null; state.shared = null; renderPanel(); return; }
+  if (urlMode()) {
+    state.info = urlInfo(state.sel);
+    state.shared = null;
+    if (!state.info) toast("That element isn't on the page any more", true);
+    renderPanel();
+    return;
+  }
   const id = encodeURIComponent(state.sel.id);
   const [info, shared] = await Promise.allSettled([api(`inspect?id=${id}`), api(`pages?id=${id}`)]);
   if (info.status === "fulfilled") state.info = info.value;
@@ -291,6 +323,7 @@ function renderTour() {
 
 /** Where else the selected element shows up, before Lika edits it. */
 function sharedSection() {
+  if (urlMode()) return null;
   const s = state.shared;
   if (!s) return null;
   if (s.error) return h("div", { class: "note", style: "margin:0 12px 12px" }, `Couldn't check which pages share this: ${s.error}`);
@@ -328,6 +361,7 @@ function select(s, { fromLayers = false } = {}) {
   renderTabs();
   renderLayers();
   refreshInfo();
+  sendPresence();
 }
 
 async function refreshChanges() {
@@ -341,6 +375,7 @@ async function refreshChanges() {
     toast(`Couldn't load the change list: ${e.message}`, true);
   }
   $("#count").textContent = state.changes.length + state.questions.length;
+  applyOverrides();
   renderTabs();
   $("#original").checked = state.showOriginal;
   renderBanner();
@@ -364,6 +399,8 @@ function sendPins() {
 }
 
 async function loadTheme() {
+  // URL mode has no theme file; spacing tokens fall back to px values.
+  if (urlMode()) { state.theme = { file: null, leaves: [] }; return; }
   try {
     state.theme = await api("theme");
   } catch (e) {
@@ -374,8 +411,42 @@ async function loadTheme() {
 
 // ---------- edits ----------
 
+// Spacing props from in-page nudges and resizes, as CSS in URL mode.
+const PROP_CSS = {
+  mt: "margin-top", mb: "margin-bottom", ml: "margin-left", mr: "margin-right",
+  pt: "padding-top", pb: "padding-bottom", pl: "padding-left", pr: "padding-right", w: "width", h: "height",
+};
+
+async function overrideEdit(body, label) {
+  let change = body;
+  if (body.type === "prop") {
+    const css = PROP_CSS[body.name];
+    if (!css) { toast(`“${body.name}” can't be changed in URL mode`, true); return; }
+    const px = typeof body.value === "number" ? body.value : tokens("spacing")[body.value] ?? parseFloat(body.value);
+    change = { type: "style", name: css, value: body.value === null ? null : `${px}px` };
+  } else if (body.type === "move") {
+    toast(`Can't move this: ${NO_MOVE}`, true);
+    return;
+  }
+  const info = urlInfo(state.sel);
+  try {
+    const r = await api("override", {
+      id: state.sel.id, page: state.route, edit: change, label,
+      element: { description: info?.description },
+      before: change.type === "text" ? info?.text?.value ?? null : info?.styles?.[change.name] ?? null,
+    });
+    toast(r.changed ? label : "No change");
+  } catch (e) {
+    toast(e.message, true);
+  }
+  await applyOverrides();
+  await refreshInfo();
+  refreshChanges();
+}
+
 async function edit(body, label) {
   if (!state.sel) return;
+  if (urlMode()) return overrideEdit(body, label);
   try {
     const r = await api("edit", { id: state.sel.id, edit: body, label });
     if (r.id !== state.sel.id) {
@@ -575,6 +646,7 @@ let layersTimer = null;
 window.__veShell = {
   canvasReady(canvas) {
     state.canvas = canvas;
+    applyOverrides();
     canvas.setMode(state.mode);
     canvas.setSelection(state.sel);
     applyPreview();
@@ -616,6 +688,7 @@ window.__veShell = {
     const touring = state.tour && state.sel && state.sel.id === state.tour.selId;
     if (state.route && route !== state.route && state.sel && !touring) select(null);
     state.route = route;
+    sendPresence();
     if (state.tour) {
       const i = state.tour.list.findIndex((p) => samePath(p.path, route));
       if (i >= 0 && i !== state.tour.i) { state.tour.i = i; renderTour(); }
@@ -626,6 +699,93 @@ window.__veShell = {
     $("#stage").style.outline = held ? "2px solid #f59e0b" : "";
   },
 };
+
+// ---------- live channel (MCP) ----------
+// Someone's own Claude, connected over MCP, can see and steer this editor:
+// the server forwards its commands here and reads back the answers.
+
+let presenceTimer = null;
+function sendPresence() {
+  clearTimeout(presenceTimer);
+  presenceTimer = setTimeout(() => {
+    const d = state.sel && state.canvas?.describe(state.sel);
+    fetch("/__ve/presence", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        page: state.route ?? null,
+        selection: state.sel ? { ...state.sel, label: d?.label ?? "" } : null,
+      }),
+    }).catch((e) => console.warn("[visual-edit] couldn't report the selection to the server", e));
+  }, 100);
+}
+
+const COMMANDS = {
+  async navigate({ path }) {
+    goToPage(path);
+    return { path };
+  },
+  async select({ id, index = 0 }) {
+    if (!state.canvas) throw new Error("The page hasn't loaded yet");
+    const s = id ? { id, index } : null;
+    if (s && !state.canvas.describe(s)) throw new Error(`No element ${id} (#${index}) on this page`);
+    select(s);
+    return { selected: s, label: s ? state.canvas.describe(s).label : null };
+  },
+  async screenshot({ target }) {
+    if (!state.canvas) throw new Error("The page hasn't loaded yet");
+    if (target === "selection" && !state.sel) throw new Error("Nothing is selected");
+    return { dataUrl: await state.canvas.shot(target === "selection" ? state.sel : null), page: state.route };
+  },
+  async describe({ id }) {
+    if (!urlMode()) throw new Error("describe is for URL mode");
+    const d = dom()?.describe(id);
+    if (!d) throw new Error(`No element ${id} on this page`);
+    return { ...d, page: state.route };
+  },
+  async themeVars() {
+    if (!urlMode()) throw new Error("themeVars is for URL mode");
+    const t = dom()?.themeVars();
+    if (!t) throw new Error("The page hasn't loaded yet");
+    return t;
+  },
+  async tree() {
+    if (!state.canvas) throw new Error("The page hasn't loaded yet");
+    return { page: state.route, tree: state.canvas.tree() };
+  },
+};
+
+let changedTimer = null;
+function connectLive() {
+  const es = new EventSource("/__ve/events");
+  es.addEventListener("command", async (ev) => {
+    const { reqId, type, ...args } = JSON.parse(ev.data);
+    let reply;
+    try {
+      const fn = COMMANDS[type];
+      if (!fn) throw new Error(`Unknown command ${type}`);
+      reply = { reqId, ok: true, result: await fn(args) };
+      // Only commands that change what the user sees are announced.
+      if (type === "navigate" || type === "select") toast(`Claude (MCP): ${type}`);
+    } catch (e) {
+      reply = { reqId, ok: false, error: e.message };
+    }
+    fetch("/__ve/reply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(reply) })
+      .catch((e) => console.warn(`[visual-edit] couldn't answer ${type}`, e));
+  });
+  // Changes made elsewhere (MCP, files edited outside the editor) show up here.
+  es.addEventListener("changed", () => {
+    clearTimeout(changedTimer);
+    changedTimer = setTimeout(async () => {
+      await refreshChanges();
+      if (state.sel) refreshInfo();
+      else if (state.tab === "theme" && urlMode()) renderPanel();
+    }, 200);
+  });
+  es.addEventListener("hello", () => sendPresence());
+  es.addEventListener("warning", (ev) => toast(JSON.parse(ev.data).message, true));
+  es.onerror = () => console.warn("[visual-edit] live channel dropped; the browser will reconnect");
+}
 
 // ---------- layers ----------
 
@@ -1104,6 +1264,7 @@ function renderDesign(panel) {
     return;
   }
   if (!info) { panel.append(h("div", { class: "empty" }, "Loading…")); return; }
+  if (urlMode()) { renderDesignUrl(panel, info); return; }
   const d = state.canvas?.describe(state.sel);
   const [file, line] = state.sel.id.split(":");
 
@@ -1189,6 +1350,195 @@ function renderDesign(panel) {
     ...info.attrs.map((a) => h("div", { class: "mono" }, `${a.name}=${a.kind === "computed" ? `{${a.source}}` : JSON.stringify(a.value)}`))));
 }
 
+// URL mode inspector: the element's computed CSS, changed as overrides.
+function cssInput(info, prop, label) {
+  const value = info.styles[prop] ?? "";
+  const isColor = /color$/.test(prop);
+  const input = h("input", { type: "text", class: "textbox", value, spellcheck: false });
+  const commit = (v) => {
+    const next = v.trim();
+    if (next === value) return;
+    edit({ type: "style", name: prop, value: next === "" ? null : next },
+      `${info.description}: ${label.toLowerCase()} ${value || "default"} → ${next || "default"}`);
+  };
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+  input.addEventListener("change", () => commit(input.value));
+  const ctl = [input];
+  if (isColor) {
+    const sw = h("button", { class: "swatch", style: `background:${value}`, title: "Pick a colour" });
+    sw.addEventListener("click", () => {
+      const picker = h("input", { type: "color" });
+      picker.addEventListener("change", () => commit(picker.value));
+      picker.click();
+    });
+    ctl.unshift(sw);
+  }
+  return field(label, h("div", { class: "ctl" }, ...ctl));
+}
+
+function renderDesignUrl(panel, info) {
+  panel.append(h("div", { class: "head" },
+    h("h2", { title: info.description }, info.description),
+    h("div", { class: "sub" },
+      info.mantine ? `${info.name} component (Mantine)` : `HTML <${info.tag}>`,
+      " · ", h("button", { class: "linkish", onclick: () => window.__veShell.selectParent() }, "Select parent ↑"),
+      " · ", askButton("Ask a developer"))));
+  panel.append(h("div", { class: "note", style: "margin:0 12px 12px" },
+    "You're editing the live site, not its code. Changes show here and go to a developer as a handoff."));
+  if (info.text.editable) {
+    const input = h("input", { type: "text", class: "textbox", value: info.text.value });
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+    input.addEventListener("change", () =>
+      edit({ type: "text", value: input.value }, `${info.description}: text → “${input.value.trim()}”`));
+    panel.append(h("section", {}, h("h3", {}, "Text content"), input,
+      h("div", { class: "note" }, "Or double-click the text on the page.")));
+  }
+  const group = (title, rows) => h("section", {}, h("h3", {}, title), ...rows.flatMap(([p, l]) => cssInput(info, p, l)));
+  panel.append(
+    group("Colour", [["color", "Text"], ["background-color", "Fill"], ["opacity", "Opacity"]]),
+    group("Typography", [["font-size", "Size"], ["font-weight", "Weight"], ["line-height", "Line height"],
+      ["letter-spacing", "Letter spacing"], ["text-align", "Align"]]),
+    group("Spacing", [["padding-top", "Padding top"], ["padding-right", "Padding right"], ["padding-bottom", "Padding bottom"],
+      ["padding-left", "Padding left"], ["margin-top", "Margin top"], ["margin-right", "Margin right"],
+      ["margin-bottom", "Margin bottom"], ["margin-left", "Margin left"], ["gap", "Gap"]]),
+    group("Size", [["width", "Width"], ["height", "Height"], ["border-radius", "Corners"]]),
+  );
+  const a11y = accessibilitySection();
+  if (a11y) panel.append(a11y);
+  panel.append(h("details", {}, h("summary", {}, "Developer info"),
+    h("div", { class: "mono" }, info.selector),
+    info.classes.length ? h("div", { class: "mono" }, `class="${info.classes.join(" ")}"`) : null));
+}
+
+// ---------- theme tab, URL mode ----------
+// The site's design tokens are the CSS variables on :root (Mantine defines
+// several hundred). A change sets variables for every page and goes into the
+// handoff with the Mantine theme key each one comes from.
+
+async function themeVarEdit(vars, label, key, before) {
+  try {
+    const r = await api("theme-vars", { vars, label, key, before });
+    toast(r.changed ? label : "No change");
+  } catch (e) {
+    toast(e.message, true);
+  }
+  await applyOverrides();
+  await refreshChanges();
+  renderPanel();
+}
+
+const pxLabel = (v) => { const px = toPx(v); return px === null ? v : `${px}`; };
+
+function themeVarInput(t, name, label) {
+  if (!(name in t.vars)) return [];
+  const value = t.vars[name];
+  const px = toPx(value);
+  const changed = state.urlTheme && name in state.urlTheme;
+  const input = h("input", { type: px === null ? "text" : "number", class: "textbox", value: px === null ? value : String(px), spellcheck: false });
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+  input.addEventListener("change", () => {
+    const raw = input.value.trim();
+    const next = raw === "" ? null : px !== null && /^[\d.]+$/.test(raw) ? `${raw}px` : raw;
+    const site = t.site[name] ?? value;
+    themeVarEdit({ [name]: next }, `Theme: ${label} ${pxLabel(value)}${px === null ? "" : "px"} → ${next === null ? "site default" : pxLabel(next) + (px === null ? "" : "px")}`,
+      name, { [name]: site });
+  });
+  const row = field(label,
+    h("div", { class: "ctl" }, input, px === null ? null : h("span", { class: "unit" }, "px")),
+    { over: changed });
+  if (changed) row[0].firstChild.title = `${label}: changed this session (the site has ${pxLabel(t.site[name] ?? value)})`;
+  return row;
+}
+
+// Changing one shade also moves the variables that were showing that exact
+// colour (the colour's "filled" and text variants, the primary colour), so a
+// button using it changes too. Translucent "light" variants don't follow.
+function shadeVars(t, color, i, next) {
+  const name = `--mantine-color-${color}-${i}`;
+  const old = (t.vars[name] ?? "").toLowerCase();
+  const vars = { [name]: next };
+  for (const [n, v] of Object.entries(t.vars)) {
+    if (n === name || v.toLowerCase() !== old) continue;
+    if (n.startsWith(`--mantine-color-${color}-`) && !/-\d$/.test(n)) vars[n] = next;
+    else if (n.startsWith("--mantine-primary-color-") && !/-\d$/.test(n)) vars[n] = next;
+    else if (n === `--mantine-primary-color-${i}`) vars[n] = next;
+  }
+  return vars;
+}
+
+function renderThemeUrl(panel) {
+  const t = dom()?.themeVars();
+  panel.append(h("div", { class: "head" }, h("h2", {}, "Theme"),
+    h("div", { class: "sub" }, "Restyles every page of the site · from its CSS variables")));
+  if (!t) { panel.append(h("div", { class: "empty" }, "Loading page…")); return; }
+  const names = Object.keys(t.vars);
+  if (!names.length) {
+    panel.append(h("div", { class: "note", style: "margin:0 12px" },
+      t.unreadable ? "This site's styles come from another domain, so its design tokens can't be read here."
+        : "This site doesn't define design tokens as CSS variables, so there's no theme to edit. Style elements one at a time on the Design tab."));
+    return;
+  }
+  const before = (vars) => Object.fromEntries(Object.keys(vars).map((n) => [n, t.site[n] ?? t.vars[n] ?? null]));
+  const section = (title, rows, note) => h("section", {}, h("h3", {}, title), note ? h("div", { class: "note" }, note) : null,
+    ...rows.flatMap(([n, l]) => themeVarInput(t, n, l)));
+  const SIZES = ["xs", "sm", "md", "lg", "xl"];
+
+  if (!t.mantine) {
+    const list = names.slice(0, 200);
+    panel.append(section(`Design tokens (${names.length})`, list.map((n) => [n, n.replace(/^--/, "")])));
+    return;
+  }
+
+  // Colours
+  const colors = [...new Set(names.map((n) => (/^--mantine-color-([A-Za-z]+)-6$/.exec(n) ?? [])[1]).filter(Boolean))];
+  const p6 = (t.vars["--mantine-primary-color-6"] ?? "").toLowerCase();
+  const primary = colors.find((c) => (t.vars[`--mantine-color-${c}-6`] ?? "").toLowerCase() === p6);
+  const defined = new Set(names);
+  const sel = h("select", { class: "textbox" }, ...colors.map((c) => h("option", { value: c, selected: c === primary }, c)));
+  sel.addEventListener("change", () => {
+    try {
+      const vars = primaryColorVars(sel.value, defined);
+      themeVarEdit(vars, `Theme: primary colour ${primary ?? "?"} → ${sel.value}`, "primaryColor", before(vars));
+    } catch (e) { toast(e.message, true); }
+  });
+  const ramps = colors.map((c) => {
+    const shades = [...Array(10).keys()].filter((i) => `--mantine-color-${c}-${i}` in t.vars);
+    const row = h("div", { class: "chips" }, ...shades.map((i) => {
+      const name = `--mantine-color-${c}-${i}`;
+      const v = t.vars[name];
+      const pick = h("input", { type: "color", value: /^#[0-9a-f]{6}$/i.test(v) ? v : "#000000", title: `${c}.${i} ${v}` });
+      pick.addEventListener("change", () => {
+        const vars = shadeVars(t, c, i, pick.value);
+        themeVarEdit(vars, `Theme: ${c}.${i} ${v} → ${pick.value}`, `colors.${c}.${i}`, before(vars));
+      });
+      const changed = state.urlTheme && name in state.urlTheme;
+      return h("label", { class: "shade", title: `${c}.${i}${changed ? " (changed)" : ""}` },
+        h("i", { style: `background:${v}${changed ? ";outline:2px solid #7c3aed" : ""}` }), pick);
+    }));
+    return h("details", { open: c === primary }, h("summary", {}, c === primary ? `${c} (primary)` : c), row);
+  });
+  panel.append(h("section", {}, h("h3", {}, "Colours"),
+    ...field("Primary colour", sel),
+    h("div", { class: "note" }, "Click a shade to change it. Buttons and text showing that exact colour follow."),
+    ...ramps));
+
+  panel.append(
+    section("Fonts", [["--mantine-font-family", "Body"], ["--mantine-font-family-headings", "Headings"],
+      ["--mantine-font-family-monospace", "Code"], ["--mantine-heading-font-weight", "Heading weight"]],
+    "Fonts must already be loaded by the site."),
+    section("Text sizes", [...SIZES.map((k) => [`--mantine-font-size-${k}`, k]),
+      ...[1, 2, 3, 4, 5, 6].map((k) => [`--mantine-h${k}-font-size`, `H${k}`])]),
+    section("Spacing scale", SIZES.map((k) => [`--mantine-spacing-${k}`, k])),
+    section("Corner radius", [["--mantine-radius-default", "Default"], ...SIZES.map((k) => [`--mantine-radius-${k}`, k])]),
+    section("Line heights", SIZES.map((k) => [`--mantine-line-height-${k}`, k])),
+  );
+  const other = names.filter((n) => !/^--mantine-(color|primary-color|font|spacing|radius|line-height|h\d|heading)/.test(n));
+  if (other.length) {
+    panel.append(h("details", {}, h("summary", {}, `Other variables (${other.length})`),
+      ...other.slice(0, 150).flatMap((n) => themeVarInput(t, n, n.replace(/^--(mantine-)?/, "")))));
+  }
+}
+
 // ---------- theme tab ----------
 
 function themeValueInput(leaf, label, { removable = false } = {}) {
@@ -1215,6 +1565,7 @@ const THEME_LABELS = {
 };
 
 function renderTheme(panel) {
+  if (urlMode()) { renderThemeUrl(panel); return; }
   const theme = state.theme;
   if (!theme) { panel.append(h("div", { class: "empty" }, "Loading theme…")); loadTheme().then(renderPanel); return; }
   panel.append(h("div", { class: "head" }, h("h2", {}, "Theme"),
@@ -1384,7 +1735,13 @@ function renderChecks(panel) {
 function renderChanges(panel) {
   panel.append(h("div", { class: "head" }, h("h2", {}, "Your changes"),
     h("div", { class: "sub" }, "Everything you've changed this session. Revert any one of them.")));
-  if (state.review) {
+  if (state.review?.dir) {
+    const r = state.review;
+    panel.append(h("div", { class: "result" },
+      h("strong", {}, `Handoff saved (${r.sent} change${r.sent === 1 ? "" : "s"}${r.asked ? `, ${r.asked} question${r.asked === 1 ? "" : "s"}` : ""})`), h("br"),
+      h("code", {}, r.dir), h("br"),
+      "A developer can give ", h("code", {}, "prompt.md"), " and the screenshots to Claude, or pull it over MCP with get_handoff."));
+  } else if (state.review) {
     const r = state.review;
     panel.append(h("div", { class: "result" },
       h("strong", {}, `Sent ${[
@@ -1426,13 +1783,15 @@ function renderChanges(panel) {
 
   const title = h("input", { type: "text", class: "textbox", placeholder: "Short title, e.g. Rounder buttons on login" });
   const notes = h("textarea", { class: "textbox", rows: 3, placeholder: "Notes for the reviewer (optional)" });
-  const send = h("button", { class: "primary", style: "margin-top:8px;width:100%" }, "Send for review");
+  const send = h("button", { class: "primary", style: "margin-top:8px;width:100%" }, urlMode() ? "Save handoff" : "Send for review");
   send.addEventListener("click", async () => {
     if (!title.value.trim()) { title.focus(); toast("Give the change a short title", true); return; }
     send.disabled = true;
     try {
-      state.review = await api("review", { title: title.value, notes: notes.value });
-      toast(`Sent for review on ${state.review.branch}`);
+      const body = { title: title.value, notes: notes.value };
+      if (urlMode()) body.screenshots = await beforeAfterShots();
+      state.review = await api("review", body);
+      toast(state.review.dir ? `Handoff saved to ${state.review.dir}` : `Sent for review on ${state.review.branch}`);
     } catch (e) {
       toast(`Couldn't send for review: ${e.message}`, true);
     }
@@ -1444,10 +1803,36 @@ function renderChanges(panel) {
   panel.append(h("section", {}, h("h3", {}, "Send for review"),
     dirty.length ? h("div", { class: "warn", style: "margin:0 0 8px" },
       `${dirty.join(", ")} already had other unsaved edits before this session. They'll be included; ask a developer if that's unexpected.`) : null,
-    h("div", { class: "note" }, state.config.allowPush
-      ? "Commits these changes to a new branch, pushes it and opens a pull request."
-      : "Commits these changes (and questions) to a new branch for a developer to review."),
-    title, h("div", { style: "height:6px" }), notes, send));
+    h("div", { class: "note" }, urlMode()
+      ? "Saves a prompt for a developer's Claude, with before and after screenshots of this page, in a folder on this computer."
+      : state.config.allowPush
+        ? "Commits these changes to a new branch, pushes it and opens a pull request."
+        : "Commits these changes (and questions) to a new branch for a developer to review."),
+    title, h("div", { style: "height:6px" }), notes, send,
+    h("button", { class: "btn", style: "margin-top:8px;width:100%", onclick: copyPrompt }, "Copy as a prompt for Claude")));
+}
+
+async function copyPrompt() {
+  try {
+    const { markdown } = await api("handoff");
+    await navigator.clipboard.writeText(markdown);
+    toast("Copied. Paste it into Claude to implement or review these changes.");
+  } catch (e) {
+    toast(`Couldn't copy the prompt: ${e.message}`, true);
+  }
+}
+
+// The current page without and with the session's overrides.
+async function beforeAfterShots() {
+  if (!state.canvas || !dom()) throw new Error("The page hasn't loaded yet");
+  const after = await state.canvas.shot(null);
+  dom().setOverrides([]);
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  try {
+    return { before: await state.canvas.shot(null), after };
+  } finally {
+    await applyOverrides();
+  }
 }
 
 // ---------- panel + tabs ----------
@@ -1590,4 +1975,5 @@ try {
   }
   renderLayers();
   renderPanel();
+  connectLive();
 })();
