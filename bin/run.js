@@ -34,6 +34,8 @@ process.chdir(appDir);
 //   VE_DEMO_USER / VE_DEMO_PASSWORD  MFA-exempt login for "Sign in as demo user"
 //   VE_DEMO_START                    page to open after that login (default /)
 //   VE_ALLOW_PUSH=1                  "Send for review" also pushes and opens a PR
+//   VE_CLAUDE=0                      turn off "Ask Claude" (uses the local `claude` CLI login)
+//   VE_CLAUDE_MODEL / VE_CLAUDE_BIN  model and command for "Ask Claude"
 const server = await vite.createServer({
   root: appDir,
   plugins: [visualEdit({
@@ -41,6 +43,9 @@ const server = await vite.createServer({
     demoPassword: process.env.VE_DEMO_PASSWORD,
     demoStart: process.env.VE_DEMO_START,
     allowPush: process.env.VE_ALLOW_PUSH === "1",
+    claude: process.env.VE_CLAUDE !== "0",
+    claudeModel: process.env.VE_CLAUDE_MODEL || undefined,
+    claudeBin: process.env.VE_CLAUDE_BIN || "claude",
   })],
   server: { port, strictPort: false }, // next free port if taken
 });

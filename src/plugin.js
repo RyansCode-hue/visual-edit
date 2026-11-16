@@ -20,6 +20,8 @@ import { stampJsx, inspect, applyEdit, applyMove, parseSource, EditError } from 
 import { readTheme, setThemeValue, isMantineComponent } from "./theme.js";
 import { revertChange, slug } from "./changes.js";
 import { countUsage } from "./usage.js";
+import { buildPageGraph, pagesFor } from "./pages.js";
+import { runClaude, claudeVersion, snapshot, diffSnapshots } from "./claude.js";
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const CANVAS_URL = "/@visual-edit/canvas.js";
@@ -141,15 +143,18 @@ export default function visualEdit(opts = {}) {
   const questions = [];
   let questionSeq = 0;
 
-  function record(abs, rel, before, after, { id = null, label, keepRedo = false }) {
+  function record(abs, rel, before, after, { id = null, label, keepRedo = false, pages = null }) {
     if (!originals.has(abs)) originals.set(abs, before);
     if (!keepRedo) redo.length = 0;
-    changes.push({ n: ++seq, abs, rel, id, label, before, after, at: Date.now() });
+    changes.push({ n: ++seq, abs, rel, id, label, before, after, pages, at: Date.now() });
     if (changes.length > MAX_CHANGES) changes.shift();
     log(`#${seq} ${label}  (${rel})`);
   }
 
   function assertEditable() {
+    if (claudeJob?.status === "running") {
+      throw new EditError("Claude is still working on the last request. Wait for it to finish, or cancel it.", 409);
+    }
     if (showOriginal) {
       throw new EditError("You're viewing the original. Switch back to your version to edit.", 409);
     }
@@ -208,6 +213,115 @@ export default function visualEdit(opts = {}) {
     await scan(root);
     sourceCache = { at: Date.now(), files };
     return files;
+  }
+
+  // ---------- Ask Claude ----------
+  // One run at a time; other edits wait, so the before/after comparison only
+  // sees the run's own changes.
+  let claudeJob = null; // { n, status, prompt, events, result }
+  let claudeSeq = 0;
+  let claudeInfo = null; // { version } or { version: null }
+
+  async function claudeStatus() {
+    if (opts.claude === false) return { enabled: false, reason: "turned off (VE_CLAUDE=0)" };
+    claudeInfo ??= { version: await claudeVersion(opts.claudeBin) };
+    return claudeInfo.version
+      ? { enabled: true, version: claudeInfo.version }
+      : { enabled: false, reason: "the claude command isn't installed on this computer" };
+  }
+
+  // Files git reports as modified anywhere in the repo, as absolute paths.
+  async function gitDirty() {
+    try {
+      const top = (await git(["rev-parse", "--show-toplevel"])).stdout.trim();
+      const out = (await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout;
+      const set = new Set();
+      for (const entry of out.split("\0")) if (entry.length > 3) set.add(path.join(top, entry.slice(3)));
+      return set;
+    } catch (e) {
+      log(`couldn't read git status: ${e.message}`);
+      return null;
+    }
+  }
+
+  async function startClaude({ id, route: page, prompt }) {
+    assertEditable();
+    const status = await claudeStatus();
+    if (!status.enabled) throw new EditError(`Ask Claude isn't available: ${status.reason}`, 409);
+    const request = cleanLabel(prompt, null);
+    if (!request) throw new EditError("Say what you'd like changed first");
+
+    const context = [`The designer is looking at the page ${cleanLabel(page, "/")}.`];
+    let reach = null;
+    if (id) {
+      const { rel, line, column } = parseId(id);
+      const code = await fs.readFile(resolveSource(root, rel), "utf8");
+      const info = inspect(code, rel, line, column);
+      const text = typeof info.text?.value === "string" ? ` with the text “${info.text.value.slice(0, 80)}”` : "";
+      context.push(`They selected the <${info.name}> element${text} whose opening tag is at ${rel}, line ${line}, column ${column + 1}.`);
+      reach = await pagesOf(id).catch(() => null);
+      if (reach?.pages.length > 1) {
+        context.push(`That element is part of ${reach.component}, which appears on ${reach.pages.length} pages ` +
+          `(${reach.pages.map((p) => p.path).join(", ")}), so a change there shows on all of them. Say so in your summary.`);
+      }
+    } else {
+      context.push("They haven't selected anything, so the request is about the page as a whole.");
+    }
+    const themeFile = await findThemeFile().catch(() => null);
+    if (themeFile) context.push(`The Mantine theme (design tokens) is in ${themeFile}.`);
+    context.push("", "Their request:", String(prompt).trim().slice(0, 4000));
+
+    const job = { n: ++claudeSeq, status: "running", prompt: request, events: [], result: null, startedAt: Date.now() };
+    claudeJob = job;
+    const before = await snapshot(root);
+    const dirtyAtStart = await gitDirty();
+    log(`Claude #${job.n}: ${request}`);
+    const run = runClaude({
+      cwd: root, prompt: context.join("\n"), model: opts.claudeModel, bin: opts.claudeBin,
+      onEvent: (lines) => {
+        for (const l of lines) job.events.push({ at: Date.now(), text: l.slice(0, 500) });
+        if (job.events.length > 300) job.events.splice(0, job.events.length - 300);
+      },
+    });
+    job.cancel = run.cancel;
+    run.done.then(async (r) => {
+      const after = await snapshot(root);
+      const touched = diffSnapshots(before, after);
+      const recorded = [];
+      const skipped = [];
+      for (const f of touched) {
+        if (f.added || f.deleted) { skipped.push(f.rel); continue; }
+        const abs = path.join(root, f.rel);
+        if (!originals.has(abs) && dirtyAtStart?.has(abs)) dirtyBefore.add(abs);
+        record(abs, f.rel, f.before, f.after, {
+          label: `Claude: “${request.slice(0, 90)}”${touched.length > 1 ? ` · ${f.rel}` : ""}`,
+          pages: reach && reach.pages.length > 1 ? { component: reach.component, list: reach.pages } : null,
+        });
+        recorded.push({ n: seq, rel: f.rel });
+      }
+      const dirtyNow = await gitDirty();
+      const outside = dirtyNow && dirtyAtStart
+        ? [...dirtyNow].filter((a) => !dirtyAtStart.has(a) && !a.startsWith(root + path.sep)) : [];
+      if (outside.length) log(`Claude #${job.n}: files outside the app changed: ${outside.join(", ")}`);
+      if (skipped.length) log(`Claude #${job.n}: files added/removed, not in the change log: ${skipped.join(", ")}`);
+      job.result = { ...r, changes: recorded, skipped, outside };
+      job.status = r.cancelled ? "cancelled" : r.ok ? "done" : "error";
+      log(`Claude #${job.n} ${job.status}: ${recorded.length} file(s) changed${r.error ? ` · ${r.error}` : ""}`);
+    }).catch((e) => {
+      job.result = { ok: false, error: `Couldn't record what Claude changed: ${e.message}`, changes: [] };
+      job.status = "error";
+      log(`Claude #${job.n} failed after running: ${e.stack ?? e.message}`);
+    });
+    return { job: job.n };
+  }
+
+  // Route → component graph, rebuilt when the source snapshot changes.
+  let pageGraph = null;
+  async function pagesOf(id) {
+    const { rel, line, column } = parseId(id);
+    const files = await listSources();
+    if (pageGraph?.files !== files) pageGraph = { files, graph: buildPageGraph(files) };
+    return pagesFor(pageGraph.graph, rel, line, column);
   }
 
   async function sendForReview({ title, notes }) {
@@ -305,6 +419,7 @@ export default function visualEdit(opts = {}) {
         demoUser: opts.demoUser ?? null,
         demoStart: opts.demoStart ?? "/",
         allowPush: Boolean(opts.allowPush),
+        claude: await claudeStatus(),
         showOriginal,
       });
     }
@@ -317,6 +432,33 @@ export default function visualEdit(opts = {}) {
       return send(res, 200, { id, ...info, mantine: isMantineComponent(code, rel, info.name) });
     }
 
+    if (isGet && route === "claude") {
+      const q = new URL(req.url, "http://x").searchParams;
+      const status = await claudeStatus();
+      if (!q.get("job")) return send(res, 200, { ...status, job: claudeJob?.status === "running" ? claudeJob.n : null });
+      const job = claudeJob?.n === Number(q.get("job")) ? claudeJob : null;
+      if (!job) throw new EditError("That Claude request is no longer available", 404);
+      const since = Number(q.get("since") ?? 0);
+      return send(res, 200, {
+        n: job.n, status: job.status, prompt: job.prompt, startedAt: job.startedAt,
+        events: job.events.slice(since), next: job.events.length, result: job.result,
+      });
+    }
+
+    if (route === "claude") {
+      return send(res, 200, await startClaude(await readBody(req)));
+    }
+
+    if (route === "claude-cancel") {
+      if (claudeJob?.status === "running") claudeJob.cancel?.();
+      return send(res, 200, { ok: true });
+    }
+
+    if (isGet && route === "pages") {
+      const id = new URL(req.url, "http://x").searchParams.get("id");
+      return send(res, 200, await pagesOf(id));
+    }
+
     if (isGet && route === "theme") {
       const rel = await findThemeFile();
       const code = await fs.readFile(path.join(root, rel), "utf8");
@@ -326,7 +468,7 @@ export default function visualEdit(opts = {}) {
     if (isGet && route === "changes") {
       return send(res, 200, {
         showOriginal,
-        changes: changes.map(({ n, rel, label, at }) => ({ n, rel, label, at })),
+        changes: changes.map(({ n, rel, label, pages, at }) => ({ n, rel, label, pages, at })),
         dirtyBefore: [...dirtyBefore].filter((a) => originals.has(a))
           .map((a) => path.relative(root, a).split(path.sep).join("/")),
       });
@@ -362,11 +504,17 @@ export default function visualEdit(opts = {}) {
         after = applyEdit(before, rel, line, column, edit ?? {});
       }
       if (after === before) return send(res, 200, { id, changed: false });
+      // Read before writing: the id points into the pre-edit source.
+      const reach = await pagesOf(id).catch((e) => {
+        log(`couldn't work out which pages show ${id}: ${e.message}`);
+        return null;
+      });
       await noteFirstTouch(abs, rel);
       await fs.writeFile(abs, after, "utf8");
       record(abs, rel, before, after, {
         id,
         label: cleanLabel(label, `${rel}:${line} ${edit.type}`),
+        pages: reach && reach.pages.length > 1 ? { component: reach.component, list: reach.pages } : null,
       });
       return send(res, 200, { id: newId, changed: true });
     }
@@ -410,7 +558,7 @@ export default function visualEdit(opts = {}) {
       const out = revertChange(current, { before: c.after, after: c.before });
       parseSource(out, c.rel);
       await fs.writeFile(c.abs, out, "utf8");
-      record(c.abs, c.rel, current, out, { id: c.id, label: c.label, keepRedo: true });
+      record(c.abs, c.rel, current, out, { id: c.id, label: c.label, keepRedo: true, pages: c.pages });
       return send(res, 200, { redone: c.label });
     }
 

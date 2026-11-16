@@ -24,6 +24,8 @@ port if taken). The app's own Vite config is used as-is with the plugin added.
 | `VE_DEMO_USER` / `VE_DEMO_PASSWORD` | MFA-exempt local login behind **Sign in as …** (server-side; the password never reaches the browser). Locally: the seeded test user. |
 | `VE_DEMO_START` | Page to open after that login (Attune: `/dashboard`). |
 | `VE_ALLOW_PUSH=1` | **Send for review** also pushes the branch and opens a PR with `gh`. Off by default. |
+| `VE_CLAUDE=0` | Turns off **Ask Claude** (on whenever the `claude` command is installed). |
+| `VE_CLAUDE_MODEL` / `VE_CLAUDE_BIN` | Model and command for **Ask Claude** (defaults: your Claude Code default, `claude`). |
 
 ## The editor
 
@@ -57,6 +59,21 @@ port if taken). The app's own Vite config is used as-is with the plugin added.
   `components.Button.defaultProps`; values this element sets itself are
   starred). **Theme** tab: colour ramps, primary colour/shade, fonts, spacing
   scale, component defaults.
+- **Shared components:** selecting something inside a component that more
+  than one page renders (a layout, a shared card) shows "Shared across N
+  pages" with the list, and *Step through them* opens each page in turn
+  (Prev/Next bar over the canvas; the selection stays on the shared
+  element). Page-only elements say "Only used on this page". The Changes tab
+  keeps the same *Step through them* link on every change to a shared
+  component, for checking the result afterwards.
+- **Ask Claude:** describe a change in words ("make this more compact") for
+  the selection, or for the page when nothing is selected. It runs the
+  person's own `claude` CLI (`claude -p`, their own Claude subscription;
+  Anthropic sales approved this use), shows progress, then Claude's plain-
+  language summary. Each changed file lands in the Changes list like any
+  other edit; **Undo this** reverts the whole run. Other edits wait while it
+  runs; Cancel stops it. Setup per person: install Claude Code and run
+  `claude` once to sign in.
 - **Preview before applying:** theme and component-wide edits are held as
   pending, shown live on the page where a Mantine CSS variable carries them
   (colours, primary colour, spacing, radius, fonts, heading weight), with how
@@ -93,6 +110,17 @@ port if taken). The app's own Vite config is used as-is with the plugin added.
   edits props/text, moves elements.
 - `src/theme.js`: reads/writes the `createTheme({...})` object.
 - `src/changes.js`: change regions and revert-any-change.
+- `src/claude.js`: runs `claude -p` fenced in: `dontAsk` permissions with
+  Read/Edit/Glob/Grep limited to the app folder (`./**`), no shell, new
+  files, web, subagents or MCP servers, project settings only (personal
+  settings can grant shell commands and other folders), and a minimal
+  environment (an `ANTHROPIC_API_KEY` would override the subscription
+  login). What changed is found by comparing the folder before and after,
+  not from Claude's own report; git changes outside the app folder are
+  flagged.
+- `src/pages.js`: route → component graph (react-router object routes or
+  `<Route>` JSX, `ROUTES.X` constants, layout nesting) to find the pages
+  that render a component.
 - `src/usage.js`: textual count of where a token/component is used (reach).
 - `src/data.js`: fetch wrapper for the test-data states (classic script,
   first in `<head>`, active only inside the editor iframe).
@@ -117,8 +145,16 @@ port if taken). The app's own Vite config is used as-is with the plugin added.
 - No formatter pass after writes (repo targets ~80 cols).
 - No screenshots in the review; reviewers use Show original.
 - Reach counts are regex over source, not a type-checked reference search.
+- Shared-page detection follows `<Component />` JSX through relative
+  imports only: components rendered by reference (`lazy()`, props holding a
+  component), path aliases, and routes needing `:params` aren't followed or
+  opened. Pages taking an id in the query string open without one.
 - Test-data states reshape JSON generically; endpoints the app needs to
   render at all (beyond session and `/api/my*`) may need adding to the
   exemptions in `src/data.js`.
 - Questions live in server memory with the change log.
+- Ask Claude edits existing files only (no new components), runs one request
+  at a time, stops after 5 minutes, and keeps no conversation between
+  requests. Anything else edited in the app folder during a run (e.g. in an
+  IDE) is attributed to the run.
 - `test/fixture-main.tsx.txt` is a snapshot of Attune's `main.tsx`.

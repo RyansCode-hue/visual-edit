@@ -40,6 +40,9 @@ const state = {
   checks: [],         // page accessibility/overflow issues
   figma: null,        // { name, tokens } imported from a Figma export
   route: "/",
+  shared: null,       // GET pages for sel: { component, isPage, pages } or { error }
+  tour: null,         // stepping through pages: { component, list, i }
+  ai: null,           // Ask Claude run: { job, status, prompt, events, next, result, startedAt }
 };
 
 // ---------- API ----------
@@ -117,14 +120,200 @@ const show = (v) => (v === undefined || v === null ? "default" : typeof v === "n
 const selLabel = () => (state.sel && state.canvas?.describe(state.sel)?.label) || state.info?.name || "Element";
 
 async function refreshInfo() {
-  if (!state.sel) { state.info = null; renderPanel(); return; }
-  try {
-    state.info = await api(`inspect?id=${encodeURIComponent(state.sel.id)}`);
-  } catch (e) {
-    state.info = null;
-    toast(e.message, true);
+  if (!state.sel) { state.info = null; state.shared = null; renderPanel(); return; }
+  const id = encodeURIComponent(state.sel.id);
+  const [info, shared] = await Promise.allSettled([api(`inspect?id=${id}`), api(`pages?id=${id}`)]);
+  if (info.status === "fulfilled") state.info = info.value;
+  else { state.info = null; toast(info.reason.message, true); }
+  if (shared.status === "fulfilled") state.shared = shared.value;
+  else {
+    state.shared = { error: shared.reason.message };
+    console.warn("[visual-edit] couldn't work out which pages show this element", shared.reason);
   }
   renderPanel();
+}
+
+// ---------- Ask Claude ----------
+
+let aiTimer = null;
+
+async function askClaude(prompt) {
+  try {
+    const { job } = await api("claude", { id: state.sel?.id ?? null, route: state.route, prompt });
+    state.ai = { job, status: "running", prompt, events: [], next: 0, result: null, startedAt: Date.now() };
+    renderAi();
+    pollAi();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function pollAi() {
+  clearTimeout(aiTimer);
+  const ai = state.ai;
+  if (!ai || ai.status !== "running") return;
+  try {
+    const r = await api(`claude?job=${ai.job}&since=${ai.next}`);
+    ai.events.push(...r.events);
+    ai.next = r.next;
+    ai.status = r.status;
+    ai.result = r.result;
+    ai.startedAt = r.startedAt;
+  } catch (e) {
+    ai.status = "error";
+    ai.result = { error: `Lost track of the Claude request: ${e.message}`, changes: [] };
+  }
+  if (ai.status === "running") {
+    renderAi();
+    aiTimer = setTimeout(pollAi, 1000);
+    return;
+  }
+  // The run rewrote source: ids in touched files may now point elsewhere.
+  const touched = new Set((ai.result?.changes ?? []).map((c) => c.rel));
+  if (state.sel && touched.has(state.sel.id.split(":")[0])) select(null);
+  await refreshChanges();
+  if (ai.result?.changes?.length) toast(`Claude changed ${ai.result.changes.length} file${ai.result.changes.length === 1 ? "" : "s"}`);
+  renderPanel();
+}
+
+async function undoAi() {
+  const ns = (state.ai?.result?.changes ?? []).map((c) => c.n).sort((a, b) => b - a);
+  for (const n of ns) {
+    try { await api("revert", { n }); } catch (e) { toast(`Couldn't undo part of Claude's change: ${e.message}`, true); break; }
+  }
+  state.ai = null;
+  toast("Undid Claude's change");
+  await loadTheme();
+  await refreshChanges();
+  await refreshInfo();
+  renderLayers();
+}
+
+function renderAi() {
+  const box = $("#ai-box");
+  if (box) box.replaceChildren(...aiBody());
+}
+
+function aiBody() {
+  const ai = state.ai;
+  if (!ai) return [];
+  if (ai.status === "running") {
+    const secs = Math.round((Date.now() - ai.startedAt) / 1000);
+    return [
+      h("div", {}, h("strong", {}, "Claude is working on: "), `“${ai.prompt}”`),
+      h("ul", { class: "ai-log" }, ...ai.events.slice(-5).map((e) => h("li", {}, e.text))),
+      h("div", { class: "actions" }, h("span", { class: "muted" }, `${secs}s`),
+        h("button", { class: "btn", onclick: () => api("claude-cancel", {}).catch((e) => toast(e.message, true)) }, "Cancel")),
+    ];
+  }
+  const r = ai.result ?? {};
+  const changes = r.changes ?? [];
+  const lastText = [...ai.events].reverse().find((e) => !/^(Reading|Editing|Searching|Looking|Using) /.test(e.text));
+  const summary = r.text || lastText?.text || "";
+  const pages = state.changes.find((c) => changes.some((x) => x.n === c.n))?.pages;
+  return [
+    h("div", {}, h("strong", {}, ai.status === "cancelled" ? "Cancelled: " : ai.status === "error" ? "Claude couldn't finish: " : "Claude: "), `“${ai.prompt}”`),
+    summary ? h("div", { class: "ai-summary" }, summary) : null,
+    r.error && ai.status !== "cancelled" ? h("div", { class: "note err" }, r.error) : null,
+    changes.length
+      ? h("div", { class: "note" }, `Changed ${changes.map((c) => c.rel).join(", ")}. It's in your Changes list like any other edit.`)
+      : h("div", { class: "note" }, "Nothing was changed."),
+    r.denials?.length ? h("div", { class: "note" }, `Blocked (outside what it's allowed to do): ${r.denials.join(", ")}`) : null,
+    r.outside?.length ? h("div", { class: "note err" }, `Files outside the app changed during the run and aren't in your Changes list: ${r.outside.join(", ")}. Ask a developer to check them.`) : null,
+    r.skipped?.length ? h("div", { class: "note err" }, `Files were added or removed and aren't in your Changes list: ${r.skipped.join(", ")}.`) : null,
+    h("div", { class: "actions" },
+      changes.length ? h("button", { class: "btn", onclick: undoAi }, "Undo this") : null,
+      pages ? h("button", { class: "btn", onclick: () => startTour(pages.component, pages.list) }, `Step through ${pages.list.length} pages`) : null,
+      h("button", { class: "linkish", onclick: () => { state.ai = null; renderPanel(); } }, "Dismiss")),
+  ];
+}
+
+/** The Ask Claude box: for the selection, or the page when nothing is selected. */
+function claudeSection() {
+  const c = state.config.claude;
+  if (!c?.enabled) return null;
+  const running = state.ai?.status === "running";
+  const input = h("textarea", {
+    class: "textbox", rows: 2, disabled: running,
+    placeholder: state.sel ? "e.g. Make this more compact, or use the brand blue" : "e.g. Give this page more breathing room",
+  });
+  const go = h("button", { class: "primary", disabled: running }, "Ask Claude");
+  const submit = () => {
+    const text = input.value.trim();
+    if (!text) { input.focus(); return; }
+    input.disabled = go.disabled = true;
+    askClaude(text).finally(() => { if (state.ai?.status !== "running") input.disabled = go.disabled = false; });
+  };
+  go.addEventListener("click", submit);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit(); } });
+  return h("section", { class: "ai" },
+    h("h3", {}, state.sel ? "Ask Claude to change this" : "Ask Claude to change this page"),
+    h("div", { id: "ai-box", class: state.ai ? "ai-box" : "" }, ...aiBody()),
+    h("div", { class: "ai-input" }, input, go),
+    h("div", { class: "note" }, "Uses your own Claude login on this computer. It can only read and edit this app's files; you can undo it like any change."));
+}
+
+// ---------- pages that share a component ----------
+
+const samePath = (a, b) => (a || "/").replace(/\/$/, "") === (b || "/").replace(/\/$/, "");
+
+function goToPage(path) {
+  frame.contentWindow.location.href = path;
+}
+
+function startTour(component, list) {
+  const pages = list.filter((p) => !p.needsParams);
+  if (!pages.length) { toast("None of those pages can be opened without an id in the address", true); return; }
+  const here = pages.findIndex((p) => samePath(p.path, state.route));
+  state.tour = { component, list: pages, i: here >= 0 ? here : 0, selId: state.sel?.id ?? null };
+  renderTour();
+  if (here < 0) goToPage(pages[0].path);
+}
+
+function renderTour() {
+  const el = $("#tour");
+  const t = state.tour;
+  el.hidden = !t;
+  if (!t) return;
+  const p = t.list[t.i];
+  const step = (d) => {
+    t.i = (t.i + d + t.list.length) % t.list.length;
+    renderTour();
+    goToPage(t.list[t.i].path);
+  };
+  el.replaceChildren(
+    h("span", { class: "grow" }, h("strong", {}, `Pages using ${t.component}`), ` · ${t.i + 1} of ${t.list.length} · `,
+      h("span", { class: "mono" }, p.path)),
+    h("button", { onclick: () => step(-1), title: "Previous page" }, "‹ Prev"),
+    h("button", { onclick: () => step(1), title: "Next page" }, "Next ›"),
+    h("button", { onclick: () => { state.tour = null; renderTour(); }, title: "Stop stepping through pages" }, "Done"));
+}
+
+/** Where else the selected element shows up, before Lika edits it. */
+function sharedSection() {
+  const s = state.shared;
+  if (!s) return null;
+  if (s.error) return h("div", { class: "note", style: "margin:0 12px 12px" }, `Couldn't check which pages share this: ${s.error}`);
+  if (s.pages.length === 1 && samePath(s.pages[0].path, state.route)) {
+    return h("div", { class: "note only-here", style: "margin:0 12px 12px" }, "✓ Only used on this page.");
+  }
+  if (s.pages.length < 2) return null;
+  return h("div", { class: "shared" },
+    h("strong", {}, `Shared across ${s.pages.length} pages`),
+    h("div", {}, `This is part of ${s.component}. Changes here show up on every page that uses it, not just this one.`),
+    h("div", { class: "actions" },
+      h("button", { class: "btn", onclick: () => startTour(s.component, s.pages) }, "Step through them"),
+      pageList(s.pages)));
+}
+
+function pageList(pages) {
+  return h("details", {},
+    h("summary", {}, "Show the list"),
+    h("ul", {}, ...pages.map((p) => h("li", {},
+      p.needsParams
+        ? h("span", { class: "mono", title: "Needs an id in the address" }, p.path)
+        : h("button", { class: "linkish mono", onclick: () => goToPage(p.path) }, p.path),
+      samePath(p.path, state.route) ? " (this page)" : ""))));
 }
 
 function select(s, { fromLayers = false } = {}) {
@@ -422,8 +611,15 @@ window.__veShell = {
     if (document.activeElement !== $("#route")) $("#route").value = route;
     // A different page has different elements; a reload of the same page
     // (e.g. after a theme edit) keeps the selection.
-    if (state.route && route !== state.route && state.sel) select(null);
+    // Stepping through the pages that share a component keeps that
+    // component's element selected, since it exists on each of them.
+    const touring = state.tour && state.sel && state.sel.id === state.tour.selId;
+    if (state.route && route !== state.route && state.sel && !touring) select(null);
     state.route = route;
+    if (state.tour) {
+      const i = state.tour.list.findIndex((p) => samePath(p.path, route));
+      if (i >= 0 && i !== state.tour.i) { state.tour.i = i; renderTour(); }
+    }
     sendPins();
   },
   spaceHeld(held) {
@@ -903,6 +1099,8 @@ function renderDesign(panel) {
     panel.append(h("div", { class: "empty" },
       "Click anything on the page to edit it.", h("br"), h("br"),
       "Drag to move · double-click text to edit · Esc selects the parent · hold Space to use the app."));
+    const ai = claudeSection();
+    if (ai) panel.append(ai);
     return;
   }
   if (!info) { panel.append(h("div", { class: "empty" }, "Loading…")); return; }
@@ -916,6 +1114,10 @@ function renderDesign(panel) {
       d?.count > 1 ? ` · repeated ×${d.count} (edits change all)` : "",
       " · ", h("button", { class: "linkish", onclick: () => window.__veShell.selectParent() }, "Select parent ↑"),
       " · ", askButton("Ask a developer"))));
+  const shared = state.scope === "instance" ? sharedSection() : null;
+  if (shared) panel.append(shared);
+  const ai = state.scope === "instance" ? claudeSection() : null;
+  if (ai) panel.append(ai);
 
   if (info.mantine) {
     const onPage = state.canvas?.countByName(info.name) ?? 0;
@@ -1216,7 +1418,9 @@ function renderChanges(panel) {
     list.append(h("div", { class: "change" },
       h("div", {}, c.label),
       h("button", { class: "btn", disabled: state.showOriginal, onclick: () => revert(c.n) }, "Revert"),
-      h("div", { class: "when" }, `${ago(c.at)} · ${c.rel}`)));
+      h("div", { class: "when" }, `${ago(c.at)} · ${c.rel}`),
+      c.pages ? h("div", { class: "page-pill" }, `Shows on ${c.pages.list.length} pages (${c.pages.component}) · `,
+        h("button", { class: "linkish", onclick: () => startTour(c.pages.component, c.pages.list) }, "Step through them")) : null));
   }
   panel.append(list);
 
@@ -1377,6 +1581,13 @@ try {
   frame.src = start;
   await loadTheme();
   await refreshChanges();
+  // A run started before this page loaded (e.g. the editor was reloaded).
+  try {
+    const c = await api("claude");
+    if (c.job) { state.ai = { job: c.job, status: "running", prompt: "", events: [], next: 0, result: null, startedAt: Date.now() }; pollAi(); }
+  } catch (e) {
+    console.warn("[visual-edit] couldn't check for a running Claude request", e);
+  }
   renderLayers();
   renderPanel();
 })();

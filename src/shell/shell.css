@@ -168,3 +168,29 @@ details[open] > summary::before { content: "▾ "; }
 .modal-card td:first-child { white-space: nowrap; font-weight: 600; width: 120px; }
 .figma-row { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
 .figma-row .vals { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+
+/* Shared-component warning and the page tour */
+.shared { background: var(--warn-soft); border: 1px solid #fde68a; border-radius: 8px; padding: 10px; margin: 0 12px 12px; }
+.shared strong { color: var(--warn); }
+.shared .actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.shared details { margin-top: 6px; }
+.shared ul { margin: 6px 0 0; padding-left: 18px; }
+.shared li { margin: 2px 0; }
+.only-here { color: var(--ok); }
+.page-pill { display: inline-block; margin-top: 4px; font-size: 12px; }
+.tour { display: flex; align-items: center; gap: 10px; padding: 6px 12px; background: var(--accent-soft);
+  color: #4c1d95; border-bottom: 1px solid #ddd6fe; }
+.tour .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tour button { background: #fff; border: 1px solid #ddd6fe; border-radius: 6px; padding: 2px 10px; color: inherit; }
+.tour button:disabled { opacity: .5; }
+
+/* Ask Claude */
+.ai .ai-input { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.ai .ai-input .primary { align-self: flex-end; }
+.ai-box { background: var(--accent-soft); border: 1px solid #ddd6fe; border-radius: 8px; padding: 10px; color: #3b0764; }
+.ai-box .actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.ai-box .muted { color: var(--muted); }
+.ai-log { margin: 6px 0 0; padding-left: 18px; color: #5b21b6; font-size: 12px; max-height: 120px; overflow: hidden; }
+.ai-log li { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ai-summary { margin-top: 6px; white-space: pre-wrap; }
+.note.err { color: var(--err); }
