@@ -67,7 +67,8 @@ non-local browser origin. With the editor open in a browser:
 | `screenshot` | The visible page or the selected element, as the user sees it. |
 | `navigate`, `select` | Drive the editor; the user sees it happen. |
 | `edit_element` | Repo: a JSX prop or text. URL: a CSS property or text. Logged and revertible. |
-| `set_theme_value` | One Mantine theme value, app-wide (repo mode). |
+| `get_theme` | Theme values: the theme file (repo) or the page's CSS variables (URL). |
+| `set_theme_value` | One theme value for every page, by Mantine key (`["spacing","md"]`, `["primaryColor"]`). Repo mode writes the theme file; URL mode sets the variables. |
 | `revert_change` | Revert one change, or the newest. |
 
 In repo mode, files that your Claude edits directly with its own tools also
@@ -146,8 +147,23 @@ reverted like any other change. The same goes for an IDE.
   spacing, size, corners) and its text. Edits are overrides on the local
   copy, kept per page and re-applied after reloads and in-app navigation.
   Selection, layers, measuring, nudging, checks, pins and Show original work
-  as in repo mode. Not available, with the reason shown: reordering, the
-  Theme tab, Ask Claude, shared-page detection. **Save handoff** writes
+  as in repo mode. Not available, with the reason shown: reordering, Ask
+  Claude, shared-page detection.
+- **URL mode Theme tab:** the site's design tokens, read from the CSS
+  variables it defines on `:root`. A change applies to every page. For
+  Mantine sites:
+  - primary colour;
+  - colour ramps (click a shade; the colour's filled and text variables and
+    the primary colour follow when they showed that exact colour);
+  - fonts and heading weight;
+  - text and heading sizes, spacing scale, corner radius and line heights,
+    in px;
+  - the remaining variables under *Other*.
+
+  Other sites get a plain list of their variables. The handoff gives each
+  change with the Mantine theme key it belongs to (`theme.spacing.md`,
+  `theme.primaryColor` → `"teal"`), so the developer edits the theme, not
+  the variable. **Save handoff** writes
   `~/.visual-edit/handoffs/<title>-<date>/` with `prompt.md`, `before.png`
   and `after.png`; **Copy as a prompt for Claude** (both modes) copies the
   same prompt.
@@ -204,11 +220,13 @@ reverted like any other change. The same goes for an IDE.
   (navigate, select, screenshot, describe) and live change notices.
 - `src/watch.js`: logs edits made outside the editor (repo mode).
 - `src/handoff.js`: the handoff prompt and per-change diffs.
+- `src/mantine-vars.js`: Mantine theme keys ↔ the CSS variables Mantine
+  sets on `:root` (URL-mode theme, MCP, handoff).
 - `src/canvas.js`: runs inside the app iframe (selection, drag, resize, text,
   layer tree, screenshots via `modern-screenshot`, with cross-origin web fonts
   inlined so text renders as on the page). `src/shell/`: the editor page.
 - `npm test`: unit tests for source, move, theme, change, usage, test-data,
-  token, proxy, override, handoff, MCP and watcher logic.
+  token, proxy, override, theme-variable, handoff, MCP and watcher logic.
 
 ## Security
 
@@ -256,8 +274,11 @@ reverted like any other change. The same goes for an IDE.
   structure changes above the element. Sites that call an API on another
   origin need that API to allow `http://localhost` (CORS). A sign-in that
   redirects through another domain (SSO) won't come back to the local copy.
-  There is no Mantine theme editing in URL mode yet; the Mantine CSS
-  variables are there to build it on. Overrides live in server memory.
+  URL-mode theme editing only reaches what the site styles through CSS
+  variables. Mantine's translucent "light" colour variants don't follow a
+  changed shade, and fonts must already be loaded by the site. Variables in
+  stylesheets from another origin can't be read. Overrides live in server
+  memory.
 - MCP commands go to the most recently opened editor tab; screenshots are
   drawn from the DOM (close to, but not exactly, the browser's own
   rendering).

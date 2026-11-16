@@ -28,6 +28,7 @@ import { countUsage } from "./usage.js";
 import { buildPageGraph, pagesFor } from "./pages.js";
 import { runClaude, claudeVersion, snapshot, diffSnapshots } from "./claude.js";
 import { handoffMarkdown } from "./handoff.js";
+import { themeKeyFor } from "./mantine-vars.js";
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 export const CANVAS_URL = "/@visual-edit/canvas.js";
@@ -44,6 +45,7 @@ const STATIC = {
   "shell.js": [here("./shell/shell.js"), "text/javascript"],
   "shell.css": [here("./shell/shell.css"), "text/css"],
   "tokens.js": [here("./shell/tokens.js"), "text/javascript"],
+  "mantine-vars.js": [here("./mantine-vars.js"), "text/javascript"],
 };
 export const API = "/__ve/";
 const MAX_BODY = 64 * 1024;
@@ -509,7 +511,8 @@ export function createEditor(opts = {}) {
   function listChanges() {
     return {
       showOriginal,
-      changes: changes.map(({ n, rel, page, label, pages, source, at }) => ({ n, rel: rel ?? page, label, pages, source, at })),
+      changes: changes.map(({ n, kind, rel, page, label, pages, source, at }) =>
+        ({ n, rel: kind === "theme" ? "theme · every page" : rel ?? page, label, pages, source, at })),
       dirtyBefore: [...dirtyBefore].filter((a) => originals.has(a))
         .map((a) => path.relative(root, a).split(path.sep).join("/")),
     };
@@ -688,6 +691,62 @@ export function createEditor(opts = {}) {
     return { changed: true, n: entry.n, id };
   }
 
+  // Theme changes in URL mode set CSS variables on :root for every page:
+  // { n, kind: "theme", key, vars: { name: after }, before: { name: before }, label, source, at }.
+  const CSS_VAR = /^--[A-Za-z0-9_-]+$/;
+  function themeOverride({ vars, before = {}, label, key, source = "editor" }) {
+    if (root) throw new EditError("Theme variables are for URL mode; edit the theme file instead", 409);
+    if (showOriginal) throw new EditError("You're viewing the original. Switch back to your version to edit.", 409);
+    const entries = Object.entries(vars ?? {});
+    if (!entries.length) throw new EditError("Nothing to change");
+    if (entries.length > 40) throw new EditError("Too many variables in one change");
+    const clean = {};
+    const was = {};
+    for (const [name, value] of entries) {
+      if (!CSS_VAR.test(name)) throw new EditError(`Not a CSS variable: ${name}`);
+      const v = value === null || value === "" ? null : String(value).slice(0, 300);
+      if (v && /[;{}<>]/.test(v)) throw new EditError(`Not a plain CSS value: ${v}`);
+      clean[name] = v;
+      // The page's own value stays "before" across repeated changes.
+      const first = changes.find((c) => c.kind === "theme" && name in c.before);
+      was[name] = first ? first.before[name] : (typeof before[name] === "string" ? before[name].slice(0, 300) : null);
+    }
+    const k = cleanLabel(key, entries.length === 1 ? entries[0][0] : "theme");
+    const entry = {
+      n: ++seq, kind: "theme", key: k, vars: clean, before: was,
+      label: cleanLabel(label, `Theme: ${k} → ${entries.length === 1 ? entries[0][1] ?? "default" : "changed"}`),
+      source, at: Date.now(),
+    };
+    redo.length = 0;
+    changes.push(entry);
+    if (changes.length > MAX_CHANGES) changes.shift();
+    log(`#${entry.n} ${entry.label}  (theme)`);
+    events.emit("changed", { n: entry.n });
+    return { changed: true, n: entry.n };
+  }
+
+  /** The CSS variables every page should get: { name: value }. */
+  function effectiveThemeVars() {
+    const out = {};
+    for (const c of changes) {
+      if (c.kind !== "theme") continue;
+      for (const [name, v] of Object.entries(c.vars)) {
+        if (v === null) delete out[name];
+        else out[name] = v;
+      }
+    }
+    return out;
+  }
+
+  /** Theme changes for the handoff: one per change, with each variable's theme key. */
+  function themeDetails() {
+    return changes.filter((c) => c.kind === "theme").map((c) => ({
+      n: c.n, label: c.label, key: c.key, source: c.source,
+      vars: Object.fromEntries(Object.entries(c.vars).map(([name, after]) =>
+        [name, { before: c.before[name] ?? null, after, themeKey: themeKeyFor(name) }])),
+    }));
+  }
+
   /** What each element on each page should show: [{ page, selector, styles, text }]. */
   function effectiveOverrides() {
     const byEl = new Map();
@@ -737,7 +796,7 @@ export function createEditor(opts = {}) {
       files.push(`${name}.png`);
     }
     const markdown = handoffMarkdown({
-      mode: "url", target: urlTarget, changes: overrideDetails(), questions,
+      mode: "url", target: urlTarget, changes: overrideDetails(), theme: themeDetails(), questions,
       notes: [t, cleanLabel(notes, "")].filter(Boolean).join("\n\n"),
       screenshots: files.map((f) => `${f}: the page ${f === "before.png" ? "without" : "with"} these changes`),
     });
@@ -752,6 +811,7 @@ export function createEditor(opts = {}) {
       mode: root ? "repo" : "url",
       target: root || target,
       changes: root ? changeDetails() : overrideDetails(),
+      theme: root ? [] : themeDetails(),
       questions,
       notes: typeof notes === "string" ? notes.slice(0, 4000) : "",
     });
@@ -762,6 +822,9 @@ export function createEditor(opts = {}) {
     override,
     effectiveOverrides,
     overrideDetails,
+    themeOverride,
+    effectiveThemeVars,
+    themeDetails,
     config, inspectElement, pagesOf, allPages, readThemeLeaves, setTheme, edit, revert, redoLast,
     setOriginal, listChanges, changeDetails, usage, sendForReview, startClaude, claudeStatus,
     claudeJobState, addQuestion, deleteQuestion,
@@ -807,7 +870,11 @@ export function createEditor(opts = {}) {
         case "usage": return send(res, 200, await usage(q().get("kind"), q().get("name")));
         case "questions": return send(res, 200, ops.listQuestions());
         case "handoff": return send(res, 200, { markdown: await handoff({ target: urlTarget }) });
-        case "overrides": return send(res, 200, { showOriginal, overrides: showOriginal ? [] : effectiveOverrides() });
+        case "overrides": return send(res, 200, {
+          showOriginal,
+          overrides: showOriginal ? [] : effectiveOverrides(),
+          themeVars: showOriginal ? {} : effectiveThemeVars(),
+        });
       }
     } else {
       switch (route) {
@@ -822,6 +889,7 @@ export function createEditor(opts = {}) {
         case "questions-delete": return send(res, 200, deleteQuestion(await readBody(req)));
         case "review": return send(res, 200, await sendForReview(await readBody(req, 20 * 1024 * 1024)));
         case "override": return send(res, 200, override(await readBody(req)));
+        case "theme-vars": return send(res, 200, themeOverride(await readBody(req)));
         case "demo-login": return send(res, 200, await demoLogin(res));
       }
     }

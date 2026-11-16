@@ -6,6 +6,8 @@
 // Inspector controls speak design vocabulary and offer design-system tokens;
 // raw Mantine props stay under "More properties" and "Developer info".
 
+import { toPx, primaryColorVars } from "/__ve/mantine-vars.js";
+
 const $ = (s, root = document) => root.querySelector(s);
 const h = (tag, props = {}, ...kids) => {
   const el = document.createElement(tag);
@@ -135,7 +137,8 @@ async function applyOverrides() {
   if (!urlMode()) return;
   try {
     const r = await api("overrides");
-    dom()?.setOverrides(r.overrides);
+    state.urlTheme = r.themeVars;
+    dom()?.setOverrides(r.overrides, r.themeVars);
   } catch (e) {
     toast(`Couldn't apply your changes to the page: ${e.message}`, true);
   }
@@ -740,6 +743,12 @@ const COMMANDS = {
     if (!d) throw new Error(`No element ${id} on this page`);
     return { ...d, page: state.route };
   },
+  async themeVars() {
+    if (!urlMode()) throw new Error("themeVars is for URL mode");
+    const t = dom()?.themeVars();
+    if (!t) throw new Error("The page hasn't loaded yet");
+    return t;
+  },
   async tree() {
     if (!state.canvas) throw new Error("The page hasn't loaded yet");
     return { page: state.route, tree: state.canvas.tree() };
@@ -756,7 +765,8 @@ function connectLive() {
       const fn = COMMANDS[type];
       if (!fn) throw new Error(`Unknown command ${type}`);
       reply = { reqId, ok: true, result: await fn(args) };
-      if (type !== "screenshot" && type !== "tree") toast(`Claude (MCP): ${type}`);
+      // Only commands that change what the user sees are announced.
+      if (type === "navigate" || type === "select") toast(`Claude (MCP): ${type}`);
     } catch (e) {
       reply = { reqId, ok: false, error: e.message };
     }
@@ -766,7 +776,11 @@ function connectLive() {
   // Changes made elsewhere (MCP, files edited outside the editor) show up here.
   es.addEventListener("changed", () => {
     clearTimeout(changedTimer);
-    changedTimer = setTimeout(() => { refreshChanges(); if (state.sel) refreshInfo(); }, 200);
+    changedTimer = setTimeout(async () => {
+      await refreshChanges();
+      if (state.sel) refreshInfo();
+      else if (state.tab === "theme" && urlMode()) renderPanel();
+    }, 200);
   });
   es.addEventListener("hello", () => sendPresence());
   es.addEventListener("warning", (ev) => toast(JSON.parse(ev.data).message, true));
@@ -1396,6 +1410,135 @@ function renderDesignUrl(panel, info) {
     info.classes.length ? h("div", { class: "mono" }, `class="${info.classes.join(" ")}"`) : null));
 }
 
+// ---------- theme tab, URL mode ----------
+// The site's design tokens are the CSS variables on :root (Mantine defines
+// several hundred). A change sets variables for every page and goes into the
+// handoff with the Mantine theme key each one comes from.
+
+async function themeVarEdit(vars, label, key, before) {
+  try {
+    const r = await api("theme-vars", { vars, label, key, before });
+    toast(r.changed ? label : "No change");
+  } catch (e) {
+    toast(e.message, true);
+  }
+  await applyOverrides();
+  await refreshChanges();
+  renderPanel();
+}
+
+const pxLabel = (v) => { const px = toPx(v); return px === null ? v : `${px}`; };
+
+function themeVarInput(t, name, label) {
+  if (!(name in t.vars)) return [];
+  const value = t.vars[name];
+  const px = toPx(value);
+  const changed = state.urlTheme && name in state.urlTheme;
+  const input = h("input", { type: px === null ? "text" : "number", class: "textbox", value: px === null ? value : String(px), spellcheck: false });
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+  input.addEventListener("change", () => {
+    const raw = input.value.trim();
+    const next = raw === "" ? null : px !== null && /^[\d.]+$/.test(raw) ? `${raw}px` : raw;
+    const site = t.site[name] ?? value;
+    themeVarEdit({ [name]: next }, `Theme: ${label} ${pxLabel(value)}${px === null ? "" : "px"} → ${next === null ? "site default" : pxLabel(next) + (px === null ? "" : "px")}`,
+      name, { [name]: site });
+  });
+  const row = field(label,
+    h("div", { class: "ctl" }, input, px === null ? null : h("span", { class: "unit" }, "px")),
+    { over: changed });
+  if (changed) row[0].firstChild.title = `${label}: changed this session (the site has ${pxLabel(t.site[name] ?? value)})`;
+  return row;
+}
+
+// Changing one shade also moves the variables that were showing that exact
+// colour (the colour's "filled" and text variants, the primary colour), so a
+// button using it changes too. Translucent "light" variants don't follow.
+function shadeVars(t, color, i, next) {
+  const name = `--mantine-color-${color}-${i}`;
+  const old = (t.vars[name] ?? "").toLowerCase();
+  const vars = { [name]: next };
+  for (const [n, v] of Object.entries(t.vars)) {
+    if (n === name || v.toLowerCase() !== old) continue;
+    if (n.startsWith(`--mantine-color-${color}-`) && !/-\d$/.test(n)) vars[n] = next;
+    else if (n.startsWith("--mantine-primary-color-") && !/-\d$/.test(n)) vars[n] = next;
+    else if (n === `--mantine-primary-color-${i}`) vars[n] = next;
+  }
+  return vars;
+}
+
+function renderThemeUrl(panel) {
+  const t = dom()?.themeVars();
+  panel.append(h("div", { class: "head" }, h("h2", {}, "Theme"),
+    h("div", { class: "sub" }, "Restyles every page of the site · from its CSS variables")));
+  if (!t) { panel.append(h("div", { class: "empty" }, "Loading page…")); return; }
+  const names = Object.keys(t.vars);
+  if (!names.length) {
+    panel.append(h("div", { class: "note", style: "margin:0 12px" },
+      t.unreadable ? "This site's styles come from another domain, so its design tokens can't be read here."
+        : "This site doesn't define design tokens as CSS variables, so there's no theme to edit. Style elements one at a time on the Design tab."));
+    return;
+  }
+  const before = (vars) => Object.fromEntries(Object.keys(vars).map((n) => [n, t.site[n] ?? t.vars[n] ?? null]));
+  const section = (title, rows, note) => h("section", {}, h("h3", {}, title), note ? h("div", { class: "note" }, note) : null,
+    ...rows.flatMap(([n, l]) => themeVarInput(t, n, l)));
+  const SIZES = ["xs", "sm", "md", "lg", "xl"];
+
+  if (!t.mantine) {
+    const list = names.slice(0, 200);
+    panel.append(section(`Design tokens (${names.length})`, list.map((n) => [n, n.replace(/^--/, "")])));
+    return;
+  }
+
+  // Colours
+  const colors = [...new Set(names.map((n) => (/^--mantine-color-([A-Za-z]+)-6$/.exec(n) ?? [])[1]).filter(Boolean))];
+  const p6 = (t.vars["--mantine-primary-color-6"] ?? "").toLowerCase();
+  const primary = colors.find((c) => (t.vars[`--mantine-color-${c}-6`] ?? "").toLowerCase() === p6);
+  const defined = new Set(names);
+  const sel = h("select", { class: "textbox" }, ...colors.map((c) => h("option", { value: c, selected: c === primary }, c)));
+  sel.addEventListener("change", () => {
+    try {
+      const vars = primaryColorVars(sel.value, defined);
+      themeVarEdit(vars, `Theme: primary colour ${primary ?? "?"} → ${sel.value}`, "primaryColor", before(vars));
+    } catch (e) { toast(e.message, true); }
+  });
+  const ramps = colors.map((c) => {
+    const shades = [...Array(10).keys()].filter((i) => `--mantine-color-${c}-${i}` in t.vars);
+    const row = h("div", { class: "chips" }, ...shades.map((i) => {
+      const name = `--mantine-color-${c}-${i}`;
+      const v = t.vars[name];
+      const pick = h("input", { type: "color", value: /^#[0-9a-f]{6}$/i.test(v) ? v : "#000000", title: `${c}.${i} ${v}` });
+      pick.addEventListener("change", () => {
+        const vars = shadeVars(t, c, i, pick.value);
+        themeVarEdit(vars, `Theme: ${c}.${i} ${v} → ${pick.value}`, `colors.${c}.${i}`, before(vars));
+      });
+      const changed = state.urlTheme && name in state.urlTheme;
+      return h("label", { class: "shade", title: `${c}.${i}${changed ? " (changed)" : ""}` },
+        h("i", { style: `background:${v}${changed ? ";outline:2px solid #7c3aed" : ""}` }), pick);
+    }));
+    return h("details", { open: c === primary }, h("summary", {}, c === primary ? `${c} (primary)` : c), row);
+  });
+  panel.append(h("section", {}, h("h3", {}, "Colours"),
+    ...field("Primary colour", sel),
+    h("div", { class: "note" }, "Click a shade to change it. Buttons and text showing that exact colour follow."),
+    ...ramps));
+
+  panel.append(
+    section("Fonts", [["--mantine-font-family", "Body"], ["--mantine-font-family-headings", "Headings"],
+      ["--mantine-font-family-monospace", "Code"], ["--mantine-heading-font-weight", "Heading weight"]],
+    "Fonts must already be loaded by the site."),
+    section("Text sizes", [...SIZES.map((k) => [`--mantine-font-size-${k}`, k]),
+      ...[1, 2, 3, 4, 5, 6].map((k) => [`--mantine-h${k}-font-size`, `H${k}`])]),
+    section("Spacing scale", SIZES.map((k) => [`--mantine-spacing-${k}`, k])),
+    section("Corner radius", [["--mantine-radius-default", "Default"], ...SIZES.map((k) => [`--mantine-radius-${k}`, k])]),
+    section("Line heights", SIZES.map((k) => [`--mantine-line-height-${k}`, k])),
+  );
+  const other = names.filter((n) => !/^--mantine-(color|primary-color|font|spacing|radius|line-height|h\d|heading)/.test(n));
+  if (other.length) {
+    panel.append(h("details", {}, h("summary", {}, `Other variables (${other.length})`),
+      ...other.slice(0, 150).flatMap((n) => themeVarInput(t, n, n.replace(/^--(mantine-)?/, "")))));
+  }
+}
+
 // ---------- theme tab ----------
 
 function themeValueInput(leaf, label, { removable = false } = {}) {
@@ -1422,6 +1565,7 @@ const THEME_LABELS = {
 };
 
 function renderTheme(panel) {
+  if (urlMode()) { renderThemeUrl(panel); return; }
   const theme = state.theme;
   if (!theme) { panel.append(h("div", { class: "empty" }, "Loading theme…")); loadTheme().then(renderPanel); return; }
   panel.append(h("div", { class: "head" }, h("h2", {}, "Theme"),
@@ -1695,7 +1839,6 @@ async function beforeAfterShots() {
 
 function renderTabs() {
   for (const b of document.querySelectorAll(".tabs button")) {
-    if (b.dataset.tab === "theme") b.hidden = urlMode();
     b.classList.toggle("on", b.dataset.tab === state.tab);
     const n = { changes: state.changes.length + state.questions.length, checks: state.checks.length }[b.dataset.tab];
     if (n !== undefined) b.textContent = `${b.dataset.tab[0].toUpperCase()}${b.dataset.tab.slice(1)}${n ? ` (${n})` : ""}`;

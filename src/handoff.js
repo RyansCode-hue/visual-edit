@@ -45,7 +45,7 @@ const SOURCE_NAMES = {
  * @param {string} [o.notes]
  * @param {string[]} [o.screenshots] file names to mention
  */
-export function handoffMarkdown({ mode, target, changes, questions, notes, screenshots = [] }) {
+export function handoffMarkdown({ mode, target, changes, theme = [], questions, notes, screenshots = [] }) {
   const out = [];
   out.push(`# Design changes from the visual editor`, "");
   if (mode === "repo") {
@@ -62,7 +62,30 @@ export function handoffMarkdown({ mode, target, changes, questions, notes, scree
     );
   }
 
-  if (!changes.length) out.push("_No changes yet._", "");
+  if (theme.length) {
+    out.push("## Theme (every page)", "",
+      "Changed through the page's CSS variables. Make each change in the theme (the key is given where the variable comes from a Mantine theme value), not by overriding the variable.",
+      "");
+    for (const t of theme) {
+      out.push(`- **${t.label}**`);
+      const vars = Object.entries(t.vars);
+      const keys = new Set(vars.map(([, v]) => v.themeKey));
+      // Switching the primary colour sets every primary-colour variable; the
+      // theme needs one value.
+      const color = keys.size === 1 && keys.has("theme.primaryColor")
+        ? /--mantine-color-([A-Za-z]+)-/.exec(vars[0][1].after ?? "")?.[1] : null;
+      if (color) {
+        out.push(`  - \`theme.primaryColor\` → \`"${color}"\` (${vars.length} CSS variables)`);
+        continue;
+      }
+      for (const [name, v] of vars) {
+        out.push(`  - \`${name}\`${v.themeKey ? ` (\`${v.themeKey}\`)` : ""}: \`${v.before ?? "(unset)"}\` → \`${v.after ?? "(unset)"}\``);
+      }
+    }
+    out.push("");
+  }
+
+  if (!changes.length && !theme.length) out.push("_No changes yet._", "");
   changes.forEach((c, i) => {
     out.push(`## ${i + 1}. ${c.label}`, "");
     if (mode === "repo") {

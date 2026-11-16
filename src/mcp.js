@@ -18,7 +18,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { EditError } from "./source.js";
 import { send, log } from "./editor.js";
-import { handoffMarkdown, changeHunk } from "./handoff.js";
+import { changeHunk } from "./handoff.js";
+import { varsForKey } from "./mantine-vars.js";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -136,7 +137,7 @@ export function buildMcpServer({ editor, live, target }) {
     inputSchema: { diffs: z.boolean().optional().describe("Include a diff per change (default true)") },
     annotations: READ,
   }, async ({ diffs = true }) => {
-    if (mode() !== "repo") return text(editor.ops.overrideDetails());
+    if (mode() !== "repo") return text({ elements: editor.ops.overrideDetails(), theme: editor.ops.themeDetails() });
     return text(editor.ops.changeDetails().map(({ before, after, ...c }) => (
       diffs ? { ...c, diff: changeHunk(c.rel, before, after) } : c
     )));
@@ -224,18 +225,48 @@ export function buildMcpServer({ editor, live, target }) {
     return text(await editor.ops.edit({ id, edit, label: label ? `Claude (MCP): ${label}` : undefined, source: "mcp" }));
   });
 
+  server.registerTool("get_theme", {
+    title: "Theme values",
+    description: "The design tokens and their current values. Repo mode: the Mantine theme file's values. URL mode: the CSS variables the page defines on :root (for Mantine sites, --mantine-spacing-xs etc.), with the site's own values of any this session changed.",
+    inputSchema: { filter: z.string().max(100).optional().describe("Only names containing this text") },
+    annotations: READ,
+  }, async ({ filter }) => {
+    const keep = (name) => !filter || name.includes(filter);
+    if (mode() === "repo") {
+      const t = await editor.ops.readThemeLeaves();
+      return text({ file: t.file, values: t.leaves.filter((l) => keep(l.path.join("."))).map((l) => ({ path: l.path, value: l.value, kind: l.kind })) });
+    }
+    const t = await live.request("themeVars");
+    return text({ mantine: t.mantine, vars: Object.fromEntries(Object.entries(t.vars).filter(([n]) => keep(n))), siteValuesOfChanged: t.site });
+  });
+
   server.registerTool("set_theme_value", {
     title: "Set theme value",
-    description: "Changes one Mantine theme value app-wide (e.g. path [\"spacing\",\"xs\"], value \"6px\"; or [\"primaryColor\"], \"teal\"). Repo mode only; affects every page.",
+    description: "Changes one theme value for every page. Path is a Mantine theme key, e.g. [\"spacing\",\"xs\"] with \"6px\" (numbers are px), [\"colors\",\"blue\",6] with \"#1c7ed6\", or [\"primaryColor\"] with \"teal\". Repo mode writes the theme file; URL mode sets the page's CSS variables, and also accepts a variable name as the path ([\"--mantine-spacing-xs\"]).",
     inputSchema: {
       path: z.array(z.union([z.string(), z.number()])).min(1).max(6),
       value: z.union([z.string().max(200), z.number(), z.boolean(), z.null()]),
       label: z.string().max(200).optional(),
     },
     annotations: WRITE,
-  }, async ({ path: p, value, label }) => text(await editor.ops.setTheme({
-    path: p, value, label: label ? `Claude (MCP): ${label}` : undefined,
-  })));
+  }, async ({ path: p, value, label }) => {
+    const lbl = label ? `Claude (MCP): ${label}` : undefined;
+    if (mode() === "repo") return text(await editor.ops.setTheme({ path: p, value, label: lbl, source: "mcp" }));
+    const t = await live.request("themeVars");
+    let vars;
+    try {
+      vars = varsForKey(p, value, new Set(Object.keys(t.vars)));
+    } catch (e) {
+      throw new EditError(e.message);
+    }
+    const missing = Object.keys(vars).filter((n) => !(n in t.vars));
+    if (missing.length) throw new EditError(`The page doesn't define ${missing.join(", ")}`);
+    const before = Object.fromEntries(Object.keys(vars).map((n) => [n, t.site[n] ?? t.vars[n]]));
+    return text(editor.ops.themeOverride({
+      vars, before, key: p.join("."), source: "mcp",
+      label: lbl ?? `Claude (MCP): theme ${p.join(".")} → ${value}`,
+    }));
+  });
 
   server.registerTool("revert_change", {
     title: "Revert change",

@@ -90,10 +90,22 @@
     return changed;
   }
 
+  // A variable's value without the session's theme changes.
+  function siteValue(name) {
+    const was = themeEl.textContent;
+    themeEl.textContent = "";
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    themeEl.textContent = was;
+    return v;
+  }
+
   // ---------- overrides ----------
   let overrides = []; // [{ page, selector, styles: {prop: value}, text }]
+  let themeVars = {}; // { "--mantine-spacing-xs": "12px" }, every page
   const styleEl = document.createElement("style");
   styleEl.id = "ve-overrides";
+  const themeEl = document.createElement("style");
+  themeEl.id = "ve-theme";
   const originalText = new WeakMap();
 
   const onThisPage = (o) => o.page === location.pathname;
@@ -106,6 +118,14 @@
       .map((o) => `${o.selector} { ${declarations(o.styles)} }`).join("\n");
     if (styleEl.textContent !== css) styleEl.textContent = css;
     if (!styleEl.isConnected && document.head) document.head.append(styleEl);
+    // Matches Mantine's own :root[data-mantine-color-scheme] rules, which
+    // define some variables per colour scheme.
+    const vars = Object.entries(themeVars);
+    const theme = vars.length
+      ? `html:root, html:root[data-mantine-color-scheme] { ${vars.map(([k, v]) => `${k}: ${v} !important;`).join(" ")} }`
+      : "";
+    if (themeEl.textContent !== theme) themeEl.textContent = theme;
+    if (!themeEl.isConnected && document.head) document.head.append(themeEl);
     for (const o of mine) {
       if (typeof o.text !== "string") continue;
       let el;
@@ -155,7 +175,8 @@
     "width", "height", "border-radius", "gap", "opacity"];
 
   window.__veDom = {
-    setOverrides(list) {
+    setOverrides(list, vars) {
+      themeVars = vars && typeof vars === "object" ? vars : {};
       // Text overrides that went away: put the page's own text back.
       const before = overrides;
       overrides = Array.isArray(list) ? list : [];
@@ -194,5 +215,32 @@
       };
     },
     restamp: schedule,
+    /**
+     * The design tokens the page defines as CSS variables on :root, with
+     * their current values: { mantine, vars: { name: value } }. Read from the
+     * page's own stylesheets; ones on other origins can't be read.
+     */
+    themeVars() {
+      const names = new Set();
+      let unreadable = 0;
+      const visit = (rules) => {
+        for (const r of rules) {
+          if (r.cssRules && !r.selectorText) { visit(r.cssRules); continue; }
+          if (!r.selectorText || !/:root|^html\b/.test(r.selectorText)) continue;
+          for (const p of r.style) if (p.startsWith("--")) names.add(p);
+        }
+      };
+      for (const sheet of document.styleSheets) {
+        if (sheet.ownerNode?.id === "ve-theme" || sheet.ownerNode?.id === "ve-preview") continue;
+        try { visit(sheet.cssRules); } catch { unreadable++; }
+      }
+      const cs = getComputedStyle(document.documentElement);
+      const vars = {};
+      for (const n of [...names].sort()) vars[n] = cs.getPropertyValue(n).trim();
+      // The site's own values of the ones this session changed.
+      const site = {};
+      for (const n of Object.keys(themeVars)) site[n] = siteValue(n);
+      return { mantine: names.has("--mantine-spacing-md"), vars, site, unreadable };
+    },
   };
 })();

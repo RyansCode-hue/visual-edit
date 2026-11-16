@@ -40,6 +40,7 @@ function fakeLive() {
         return { id: args.id, page: "/login", description: "Title “Hi”", text: { editable: true, value: "Hi" }, styles: { color: "rgb(0, 0, 0)" } };
       }
       if (type === "screenshot") return { dataUrl: "data:image/png;base64,iVBORw0KGgo=", page: "/login" };
+      if (type === "themeVars") return { mantine: true, vars: { "--mantine-spacing-xs": "calc(0.375rem * 1)" }, site: {} };
       throw new Error(`unexpected ${type}`);
     },
   };
@@ -92,5 +93,19 @@ test("errors come back as tool errors, not silence", async () => {
   assert.match(textOf(r), /use type "style"/);
   const t = await client.callTool({ name: "set_theme_value", arguments: { path: ["primaryColor"], value: "teal" } });
   assert.equal(t.isError, true);
-  assert.match(textOf(t), /opened on a URL/);
+  assert.match(textOf(t), /no colour “teal”/);
+});
+
+test("URL mode theme over MCP sets the page's variables", async () => {
+  const editor = createEditor({ claude: false });
+  editor.setUrlTarget("https://site.test");
+  const client = await connect(editor, fakeLive());
+  const r = await client.callTool({ name: "set_theme_value", arguments: { path: ["spacing", "xs"], value: 10 } });
+  assert.equal(JSON.parse(textOf(r)).changed, true);
+  assert.deepEqual(editor.ops.effectiveThemeVars(), { "--mantine-spacing-xs": "10px" });
+  assert.equal(editor.ops.themeDetails()[0].vars["--mantine-spacing-xs"].before, "calc(0.375rem * 1)");
+  const missing = await client.callTool({ name: "set_theme_value", arguments: { path: ["spacing", "xl"], value: 30 } });
+  assert.match(textOf(missing), /doesn't define --mantine-spacing-xl/);
+  const theme = JSON.parse(textOf(await client.callTool({ name: "get_theme", arguments: {} })));
+  assert.equal(theme.mantine, true);
 });
