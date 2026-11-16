@@ -119,8 +119,37 @@ const show = (v) => (v === undefined || v === null ? "default" : typeof v === "n
 
 const selLabel = () => (state.sel && state.canvas?.describe(state.sel)?.label) || state.info?.name || "Element";
 
+// URL mode: the editor was opened on a live site, not the app's code. Elements
+// come from the DOM (stamp-dom.js), and changes are kept as style and text
+// overrides that end up in a handoff instead of in the code.
+const urlMode = () => state.config?.mode === "url";
+const dom = () => frame.contentWindow?.__veDom ?? null;
+const NO_MOVE = "moving needs the code; open the editor on the app folder to reorder things";
+
+function urlInfo(s) {
+  const d = dom()?.describe(s.id);
+  return d ? { ...d, move: { movable: false, reason: NO_MOVE } } : null;
+}
+
+async function applyOverrides() {
+  if (!urlMode()) return;
+  try {
+    const r = await api("overrides");
+    dom()?.setOverrides(r.overrides);
+  } catch (e) {
+    toast(`Couldn't apply your changes to the page: ${e.message}`, true);
+  }
+}
+
 async function refreshInfo() {
   if (!state.sel) { state.info = null; state.shared = null; renderPanel(); return; }
+  if (urlMode()) {
+    state.info = urlInfo(state.sel);
+    state.shared = null;
+    if (!state.info) toast("That element isn't on the page any more", true);
+    renderPanel();
+    return;
+  }
   const id = encodeURIComponent(state.sel.id);
   const [info, shared] = await Promise.allSettled([api(`inspect?id=${id}`), api(`pages?id=${id}`)]);
   if (info.status === "fulfilled") state.info = info.value;
@@ -291,6 +320,7 @@ function renderTour() {
 
 /** Where else the selected element shows up, before Lika edits it. */
 function sharedSection() {
+  if (urlMode()) return null;
   const s = state.shared;
   if (!s) return null;
   if (s.error) return h("div", { class: "note", style: "margin:0 12px 12px" }, `Couldn't check which pages share this: ${s.error}`);
@@ -328,6 +358,7 @@ function select(s, { fromLayers = false } = {}) {
   renderTabs();
   renderLayers();
   refreshInfo();
+  sendPresence();
 }
 
 async function refreshChanges() {
@@ -341,6 +372,7 @@ async function refreshChanges() {
     toast(`Couldn't load the change list: ${e.message}`, true);
   }
   $("#count").textContent = state.changes.length + state.questions.length;
+  applyOverrides();
   renderTabs();
   $("#original").checked = state.showOriginal;
   renderBanner();
@@ -364,6 +396,8 @@ function sendPins() {
 }
 
 async function loadTheme() {
+  // URL mode has no theme file; spacing tokens fall back to px values.
+  if (urlMode()) { state.theme = { file: null, leaves: [] }; return; }
   try {
     state.theme = await api("theme");
   } catch (e) {
@@ -374,8 +408,42 @@ async function loadTheme() {
 
 // ---------- edits ----------
 
+// Spacing props from in-page nudges and resizes, as CSS in URL mode.
+const PROP_CSS = {
+  mt: "margin-top", mb: "margin-bottom", ml: "margin-left", mr: "margin-right",
+  pt: "padding-top", pb: "padding-bottom", pl: "padding-left", pr: "padding-right", w: "width", h: "height",
+};
+
+async function overrideEdit(body, label) {
+  let change = body;
+  if (body.type === "prop") {
+    const css = PROP_CSS[body.name];
+    if (!css) { toast(`“${body.name}” can't be changed in URL mode`, true); return; }
+    const px = typeof body.value === "number" ? body.value : tokens("spacing")[body.value] ?? parseFloat(body.value);
+    change = { type: "style", name: css, value: body.value === null ? null : `${px}px` };
+  } else if (body.type === "move") {
+    toast(`Can't move this: ${NO_MOVE}`, true);
+    return;
+  }
+  const info = urlInfo(state.sel);
+  try {
+    const r = await api("override", {
+      id: state.sel.id, page: state.route, edit: change, label,
+      element: { description: info?.description },
+      before: change.type === "text" ? info?.text?.value ?? null : info?.styles?.[change.name] ?? null,
+    });
+    toast(r.changed ? label : "No change");
+  } catch (e) {
+    toast(e.message, true);
+  }
+  await applyOverrides();
+  await refreshInfo();
+  refreshChanges();
+}
+
 async function edit(body, label) {
   if (!state.sel) return;
+  if (urlMode()) return overrideEdit(body, label);
   try {
     const r = await api("edit", { id: state.sel.id, edit: body, label });
     if (r.id !== state.sel.id) {
@@ -575,6 +643,7 @@ let layersTimer = null;
 window.__veShell = {
   canvasReady(canvas) {
     state.canvas = canvas;
+    applyOverrides();
     canvas.setMode(state.mode);
     canvas.setSelection(state.sel);
     applyPreview();
@@ -616,6 +685,7 @@ window.__veShell = {
     const touring = state.tour && state.sel && state.sel.id === state.tour.selId;
     if (state.route && route !== state.route && state.sel && !touring) select(null);
     state.route = route;
+    sendPresence();
     if (state.tour) {
       const i = state.tour.list.findIndex((p) => samePath(p.path, route));
       if (i >= 0 && i !== state.tour.i) { state.tour.i = i; renderTour(); }
@@ -626,6 +696,82 @@ window.__veShell = {
     $("#stage").style.outline = held ? "2px solid #f59e0b" : "";
   },
 };
+
+// ---------- live channel (MCP) ----------
+// Someone's own Claude, connected over MCP, can see and steer this editor:
+// the server forwards its commands here and reads back the answers.
+
+let presenceTimer = null;
+function sendPresence() {
+  clearTimeout(presenceTimer);
+  presenceTimer = setTimeout(() => {
+    const d = state.sel && state.canvas?.describe(state.sel);
+    fetch("/__ve/presence", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        page: state.route ?? null,
+        selection: state.sel ? { ...state.sel, label: d?.label ?? "" } : null,
+      }),
+    }).catch((e) => console.warn("[visual-edit] couldn't report the selection to the server", e));
+  }, 100);
+}
+
+const COMMANDS = {
+  async navigate({ path }) {
+    goToPage(path);
+    return { path };
+  },
+  async select({ id, index = 0 }) {
+    if (!state.canvas) throw new Error("The page hasn't loaded yet");
+    const s = id ? { id, index } : null;
+    if (s && !state.canvas.describe(s)) throw new Error(`No element ${id} (#${index}) on this page`);
+    select(s);
+    return { selected: s, label: s ? state.canvas.describe(s).label : null };
+  },
+  async screenshot({ target }) {
+    if (!state.canvas) throw new Error("The page hasn't loaded yet");
+    if (target === "selection" && !state.sel) throw new Error("Nothing is selected");
+    return { dataUrl: await state.canvas.shot(target === "selection" ? state.sel : null), page: state.route };
+  },
+  async describe({ id }) {
+    if (!urlMode()) throw new Error("describe is for URL mode");
+    const d = dom()?.describe(id);
+    if (!d) throw new Error(`No element ${id} on this page`);
+    return { ...d, page: state.route };
+  },
+  async tree() {
+    if (!state.canvas) throw new Error("The page hasn't loaded yet");
+    return { page: state.route, tree: state.canvas.tree() };
+  },
+};
+
+let changedTimer = null;
+function connectLive() {
+  const es = new EventSource("/__ve/events");
+  es.addEventListener("command", async (ev) => {
+    const { reqId, type, ...args } = JSON.parse(ev.data);
+    let reply;
+    try {
+      const fn = COMMANDS[type];
+      if (!fn) throw new Error(`Unknown command ${type}`);
+      reply = { reqId, ok: true, result: await fn(args) };
+      if (type !== "screenshot" && type !== "tree") toast(`Claude (MCP): ${type}`);
+    } catch (e) {
+      reply = { reqId, ok: false, error: e.message };
+    }
+    fetch("/__ve/reply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(reply) })
+      .catch((e) => console.warn(`[visual-edit] couldn't answer ${type}`, e));
+  });
+  // Changes made elsewhere (MCP, files edited outside the editor) show up here.
+  es.addEventListener("changed", () => {
+    clearTimeout(changedTimer);
+    changedTimer = setTimeout(() => { refreshChanges(); if (state.sel) refreshInfo(); }, 200);
+  });
+  es.addEventListener("hello", () => sendPresence());
+  es.addEventListener("warning", (ev) => toast(JSON.parse(ev.data).message, true));
+  es.onerror = () => console.warn("[visual-edit] live channel dropped; the browser will reconnect");
+}
 
 // ---------- layers ----------
 
@@ -1104,6 +1250,7 @@ function renderDesign(panel) {
     return;
   }
   if (!info) { panel.append(h("div", { class: "empty" }, "Loading…")); return; }
+  if (urlMode()) { renderDesignUrl(panel, info); return; }
   const d = state.canvas?.describe(state.sel);
   const [file, line] = state.sel.id.split(":");
 
@@ -1187,6 +1334,66 @@ function renderDesign(panel) {
   panel.append(h("details", {}, h("summary", {}, "Developer info"),
     h("div", { class: "mono" }, `<${info.name}>  ${file}:${line}`),
     ...info.attrs.map((a) => h("div", { class: "mono" }, `${a.name}=${a.kind === "computed" ? `{${a.source}}` : JSON.stringify(a.value)}`))));
+}
+
+// URL mode inspector: the element's computed CSS, changed as overrides.
+function cssInput(info, prop, label) {
+  const value = info.styles[prop] ?? "";
+  const isColor = /color$/.test(prop);
+  const input = h("input", { type: "text", class: "textbox", value, spellcheck: false });
+  const commit = (v) => {
+    const next = v.trim();
+    if (next === value) return;
+    edit({ type: "style", name: prop, value: next === "" ? null : next },
+      `${info.description}: ${label.toLowerCase()} ${value || "default"} → ${next || "default"}`);
+  };
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+  input.addEventListener("change", () => commit(input.value));
+  const ctl = [input];
+  if (isColor) {
+    const sw = h("button", { class: "swatch", style: `background:${value}`, title: "Pick a colour" });
+    sw.addEventListener("click", () => {
+      const picker = h("input", { type: "color" });
+      picker.addEventListener("change", () => commit(picker.value));
+      picker.click();
+    });
+    ctl.unshift(sw);
+  }
+  return field(label, h("div", { class: "ctl" }, ...ctl));
+}
+
+function renderDesignUrl(panel, info) {
+  panel.append(h("div", { class: "head" },
+    h("h2", { title: info.description }, info.description),
+    h("div", { class: "sub" },
+      info.mantine ? `${info.name} component (Mantine)` : `HTML <${info.tag}>`,
+      " · ", h("button", { class: "linkish", onclick: () => window.__veShell.selectParent() }, "Select parent ↑"),
+      " · ", askButton("Ask a developer"))));
+  panel.append(h("div", { class: "note", style: "margin:0 12px 12px" },
+    "You're editing the live site, not its code. Changes show here and go to a developer as a handoff."));
+  if (info.text.editable) {
+    const input = h("input", { type: "text", class: "textbox", value: info.text.value });
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+    input.addEventListener("change", () =>
+      edit({ type: "text", value: input.value }, `${info.description}: text → “${input.value.trim()}”`));
+    panel.append(h("section", {}, h("h3", {}, "Text content"), input,
+      h("div", { class: "note" }, "Or double-click the text on the page.")));
+  }
+  const group = (title, rows) => h("section", {}, h("h3", {}, title), ...rows.flatMap(([p, l]) => cssInput(info, p, l)));
+  panel.append(
+    group("Colour", [["color", "Text"], ["background-color", "Fill"], ["opacity", "Opacity"]]),
+    group("Typography", [["font-size", "Size"], ["font-weight", "Weight"], ["line-height", "Line height"],
+      ["letter-spacing", "Letter spacing"], ["text-align", "Align"]]),
+    group("Spacing", [["padding-top", "Padding top"], ["padding-right", "Padding right"], ["padding-bottom", "Padding bottom"],
+      ["padding-left", "Padding left"], ["margin-top", "Margin top"], ["margin-right", "Margin right"],
+      ["margin-bottom", "Margin bottom"], ["margin-left", "Margin left"], ["gap", "Gap"]]),
+    group("Size", [["width", "Width"], ["height", "Height"], ["border-radius", "Corners"]]),
+  );
+  const a11y = accessibilitySection();
+  if (a11y) panel.append(a11y);
+  panel.append(h("details", {}, h("summary", {}, "Developer info"),
+    h("div", { class: "mono" }, info.selector),
+    info.classes.length ? h("div", { class: "mono" }, `class="${info.classes.join(" ")}"`) : null));
 }
 
 // ---------- theme tab ----------
@@ -1384,7 +1591,13 @@ function renderChecks(panel) {
 function renderChanges(panel) {
   panel.append(h("div", { class: "head" }, h("h2", {}, "Your changes"),
     h("div", { class: "sub" }, "Everything you've changed this session. Revert any one of them.")));
-  if (state.review) {
+  if (state.review?.dir) {
+    const r = state.review;
+    panel.append(h("div", { class: "result" },
+      h("strong", {}, `Handoff saved (${r.sent} change${r.sent === 1 ? "" : "s"}${r.asked ? `, ${r.asked} question${r.asked === 1 ? "" : "s"}` : ""})`), h("br"),
+      h("code", {}, r.dir), h("br"),
+      "A developer can give ", h("code", {}, "prompt.md"), " and the screenshots to Claude, or pull it over MCP with get_handoff."));
+  } else if (state.review) {
     const r = state.review;
     panel.append(h("div", { class: "result" },
       h("strong", {}, `Sent ${[
@@ -1426,13 +1639,15 @@ function renderChanges(panel) {
 
   const title = h("input", { type: "text", class: "textbox", placeholder: "Short title, e.g. Rounder buttons on login" });
   const notes = h("textarea", { class: "textbox", rows: 3, placeholder: "Notes for the reviewer (optional)" });
-  const send = h("button", { class: "primary", style: "margin-top:8px;width:100%" }, "Send for review");
+  const send = h("button", { class: "primary", style: "margin-top:8px;width:100%" }, urlMode() ? "Save handoff" : "Send for review");
   send.addEventListener("click", async () => {
     if (!title.value.trim()) { title.focus(); toast("Give the change a short title", true); return; }
     send.disabled = true;
     try {
-      state.review = await api("review", { title: title.value, notes: notes.value });
-      toast(`Sent for review on ${state.review.branch}`);
+      const body = { title: title.value, notes: notes.value };
+      if (urlMode()) body.screenshots = await beforeAfterShots();
+      state.review = await api("review", body);
+      toast(state.review.dir ? `Handoff saved to ${state.review.dir}` : `Sent for review on ${state.review.branch}`);
     } catch (e) {
       toast(`Couldn't send for review: ${e.message}`, true);
     }
@@ -1444,16 +1659,43 @@ function renderChanges(panel) {
   panel.append(h("section", {}, h("h3", {}, "Send for review"),
     dirty.length ? h("div", { class: "warn", style: "margin:0 0 8px" },
       `${dirty.join(", ")} already had other unsaved edits before this session. They'll be included; ask a developer if that's unexpected.`) : null,
-    h("div", { class: "note" }, state.config.allowPush
-      ? "Commits these changes to a new branch, pushes it and opens a pull request."
-      : "Commits these changes (and questions) to a new branch for a developer to review."),
-    title, h("div", { style: "height:6px" }), notes, send));
+    h("div", { class: "note" }, urlMode()
+      ? "Saves a prompt for a developer's Claude, with before and after screenshots of this page, in a folder on this computer."
+      : state.config.allowPush
+        ? "Commits these changes to a new branch, pushes it and opens a pull request."
+        : "Commits these changes (and questions) to a new branch for a developer to review."),
+    title, h("div", { style: "height:6px" }), notes, send,
+    h("button", { class: "btn", style: "margin-top:8px;width:100%", onclick: copyPrompt }, "Copy as a prompt for Claude")));
+}
+
+async function copyPrompt() {
+  try {
+    const { markdown } = await api("handoff");
+    await navigator.clipboard.writeText(markdown);
+    toast("Copied. Paste it into Claude to implement or review these changes.");
+  } catch (e) {
+    toast(`Couldn't copy the prompt: ${e.message}`, true);
+  }
+}
+
+// The current page without and with the session's overrides.
+async function beforeAfterShots() {
+  if (!state.canvas || !dom()) throw new Error("The page hasn't loaded yet");
+  const after = await state.canvas.shot(null);
+  dom().setOverrides([]);
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  try {
+    return { before: await state.canvas.shot(null), after };
+  } finally {
+    await applyOverrides();
+  }
 }
 
 // ---------- panel + tabs ----------
 
 function renderTabs() {
   for (const b of document.querySelectorAll(".tabs button")) {
+    if (b.dataset.tab === "theme") b.hidden = urlMode();
     b.classList.toggle("on", b.dataset.tab === state.tab);
     const n = { changes: state.changes.length + state.questions.length, checks: state.checks.length }[b.dataset.tab];
     if (n !== undefined) b.textContent = `${b.dataset.tab[0].toUpperCase()}${b.dataset.tab.slice(1)}${n ? ` (${n})` : ""}`;
@@ -1590,4 +1832,5 @@ try {
   }
   renderLayers();
   renderPanel();
+  connectLive();
 })();

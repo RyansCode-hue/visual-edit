@@ -47,6 +47,44 @@ function init(shell) {
   text-align: center; line-height: 18px; cursor: pointer; box-shadow: 0 1px 3px #0005; }
 `;
 
+  // Web fonts from other origins (e.g. Google Fonts), inlined as data URLs.
+  // The screenshot library renders through an SVG image, which can't load
+  // external files or read cross-origin stylesheets, so without this text
+  // falls back to other fonts and wraps differently. Latin subsets only.
+  let fontCssCache = null;
+  function embeddedFontCss() {
+    fontCssCache ??= (async () => {
+      const hrefs = [...document.styleSheets].map((sh) => sh.href)
+        .filter((h) => h && new URL(h).origin !== location.origin);
+      const sheets = await Promise.all(hrefs.map(async (h) => {
+        const r = await fetch(h);
+        if (!r.ok) throw new Error(`HTTP ${r.status} for ${h}`);
+        return r.text();
+      }));
+      const faces = sheets.join("\n").match(/@font-face\s*{[^}]*}/g) ?? [];
+      const latin = faces.filter((f) => !/unicode-range/.test(f) || /U\+0000-00FF/i.test(f));
+      const toDataUrl = async (url) => {
+        const blob = await (await fetch(url)).blob();
+        return new Promise((res, rej) => {
+          const fr = new FileReader();
+          fr.onload = () => res(fr.result);
+          fr.onerror = () => rej(fr.error);
+          fr.readAsDataURL(blob);
+        });
+      };
+      const out = await Promise.all(latin.map(async (f) => {
+        const m = /url\(([^)]+)\)/.exec(f);
+        return m ? f.replace(m[0], `url(${await toDataUrl(m[1].replace(/['"]/g, ""))})`) : f;
+      }));
+      return out.join("\n");
+    })().catch((e) => {
+      console.warn("[visual-edit] screenshots will use fallback fonts:", e);
+      fontCssCache = null;
+      return "";
+    });
+    return fontCssCache;
+  }
+
   const host = document.createElement("div");
   host.id = "visual-edit-canvas";
   const shadow = host.attachShadow({ mode: "open" });
@@ -792,6 +830,43 @@ ${'<div class="mline"></div><div class="mlabel"></div>'.repeat(4)}
     elementChecks(s) {
       const el = find(s);
       return el ? checksFor(el) : null;
+    },
+    /**
+     * PNG data URL of one selection, or of the visible page. Drawn from the
+     * DOM in the page itself, so it shows what the signed-in user sees.
+     */
+    async shot(s) {
+      const { domToPng } = await import("/@visual-edit/shot.js");
+      const el = s ? find(s) : null;
+      if (s && !el) throw new Error("That element isn't on the page any more");
+      if (el) el.scrollIntoView({ block: "nearest", inline: "nearest" });
+      // Always draw the viewport, then crop: drawing a single element on its
+      // own loses the layout context around it (inherited line boxes,
+      // positioning) and shifts its content.
+      const page = await domToPng(document.documentElement, {
+        scale: 1,
+        width: innerWidth,
+        height: innerHeight,
+        style: { transform: `translate(${-scrollX}px, ${-scrollY}px)` },
+        filter: (node) => node.id !== "visual-edit-canvas",
+        font: { cssText: await embeddedFontCss() },
+      });
+      if (!el) return page;
+      const r = el.getBoundingClientRect();
+      const pad = 8;
+      const x = Math.max(0, Math.floor(r.left - pad));
+      const y = Math.max(0, Math.floor(r.top - pad));
+      const w = Math.min(innerWidth, Math.ceil(r.right + pad)) - x;
+      const h = Math.min(innerHeight, Math.ceil(r.bottom + pad)) - y;
+      if (w <= 0 || h <= 0) throw new Error("That element isn't visible on the page");
+      const img = new Image();
+      img.src = page;
+      await img.decode();
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      c.getContext("2d").drawImage(img, x, y, w, h, 0, 0, w, h);
+      return c.toDataURL("image/png");
     },
   };
   window.__veCanvas = api;
